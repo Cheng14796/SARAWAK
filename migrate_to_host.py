@@ -17,7 +17,7 @@ import argparse
 import os
 import subprocess
 import sys
-from urllib.parse import urlparse, unquote
+from urllib.parse import urlparse, unquote, quote
 
 import psycopg2
 from psycopg2 import sql as pgsql
@@ -65,7 +65,14 @@ def find_tool(name):
 
 def parse_target(url):
     p = urlparse(url)
-    return {"host": p.hostname or "", "port": str(p.port or 5432),
+    host = p.hostname or ""
+    # Neon's "-pooler" host runs PgBouncer, which will not carry CREATE
+    # DATABASE or a whole-schema restore. The direct endpoint is the same
+    # server without the pooler in front, so migrate through that.
+    if "-pooler." in host:
+        host = host.replace("-pooler.", ".")
+        print("using the direct endpoint for the copy:", host)
+    return {"host": host, "port": str(p.port or 5432),
             "user": unquote(p.username or ""), "password": unquote(p.password or ""),
             "database": (p.path or "/postgres").lstrip("/") or "postgres",
             "sslmode": "require" if "sslmode=require" in (p.query or "") else "prefer"}
@@ -134,9 +141,12 @@ def copy_database(pg_dump, psql, target, dbname):
     for t in SKIP_TABLES:
         dump_cmd += ["--exclude-table", t]
 
+    # Everything user-supplied gets percent-encoded - "sarawak basin" has a
+    # space in it, and psql rejects a URL that carries one literally.
     target_url = "postgresql://{u}:{p}@{h}:{P}/{d}?sslmode={s}".format(
-        u=target["user"], p=target["password"], h=target["host"],
-        P=target["port"], d=dbname, s=target["sslmode"])
+        u=quote(target["user"], safe=""), p=quote(target["password"], safe=""),
+        h=target["host"], P=target["port"],
+        d=quote(dbname, safe=""), s=target["sslmode"])
     load_cmd = [psql, "--dbname", target_url, "--quiet",
                 "--set", "ON_ERROR_STOP=0", "--file", "-"]
 
