@@ -1,0 +1,24 @@
+# Render blueprint. Point Render at this repo and it reads this file.
+#
+# One worker on purpose: the schema cache and the follow-up memory live in
+# process, so several workers would each hold their own half-warm copy.
+# Threads give the concurrency instead.
+services:
+  - type: web
+    name: sarawak-database-chat
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn chatbox:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 120
+    healthCheckPath: /healthz
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.6"
+      - key: DATABASE_URL
+        sync: false          # paste the managed Postgres URL in the dashboard
+      - key: VISIBLE_DATABASES
+        value: "sarawak basin,subbasin_gis"
+      - key: ALLOW_RAW_SQL
+        value: "0"           # public site: plain English only, no typed SQL
+      - key: SECRET_KEY
+        generateValue: true

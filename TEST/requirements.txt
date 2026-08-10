@@ -1,0 +1,10 @@
+Flask==3.0.3
+psycopg2-binary==2.9.9
+gunicorn==22.0.0
+
+# Shapefile export. These are the heavy ones (~150 MB installed); drop them
+# and every other format still works - the Shapefile button just reports that
+# the server cannot build one.
+geopandas==1.0.1
+shapely==2.0.6
+pyogrio==0.10.0
