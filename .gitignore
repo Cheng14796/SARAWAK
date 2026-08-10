@@ -2,4 +2,6 @@
 __pycache__/
 *.pyc
 *.zip
-.claude/settings.local.json
+.claude/
+.agents/
+skills-lock.json
