@@ -1,8 +1,8 @@
 # Render blueprint. Point Render at this repo and it reads this file.
 #
-# One worker on purpose: the schema cache and the follow-up memory live in
-# process, so several workers would each hold their own half-warm copy.
-# Threads give the concurrency instead.
+# One worker on purpose: the schema cache, the connection pool and the
+# follow-up memory all live in process, so several workers would each hold
+# their own half-warm copy. Threads give the concurrency instead.
 services:
   - type: web
     name: sarawak-database-chat
@@ -22,3 +22,25 @@ services:
         value: "0"           # public site: plain English only, no typed SQL
       - key: SECRET_KEY
         generateValue: true
+
+      # Kill a runaway query rather than let it hold one of the four threads
+      # until gunicorn's timeout.
+      - key: STATEMENT_TIMEOUT_MS
+        value: "20000"
+
+      # Six connections for four threads, so the pool never runs dry while a
+      # download is streaming.
+      - key: DB_POOL_MAX
+        value: "6"
+
+      # Per visitor, per minute.
+      - key: ASK_LIMIT_PER_MINUTE
+        value: "40"
+      - key: EXPORT_LIMIT_PER_MINUTE
+        value: "10"
+
+      # Refuse a whole-table download bigger than this instead of spending the
+      # free tier's bandwidth on it. Answers are unaffected - they are already
+      # filtered. 0 removes the ceiling.
+      - key: MAX_EXPORT_ROWS
+        value: "250000"

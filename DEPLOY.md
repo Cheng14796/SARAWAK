@@ -4,8 +4,8 @@
 
 Netlify hosts **static files** — HTML, CSS, images. This app is not static:
 
-- The page does not exist as a file. Flask builds it at runtime from the
-  `HTML_PAGE` string in `chatbox.py` when a browser asks for `/`.
+- The page is a Flask template (`templates/index.html`) that only exists once
+  Python has rendered it, and it is useless without the API behind it.
 - Every action calls back to Python: `/api/databases`, `/api/schema`,
   `/api/ask`, `/api/export`.
 - The data lives in PostgreSQL **on your own PC**. Nothing on the internet
@@ -85,6 +85,7 @@ Your site appears at `https://<name>.onrender.com`.
 
 - The dropdown lists **sarawak basin** and **subbasin_gis**
 - "how many type of subbasin here" answers with names — Baleh 1, Rajang 2, …
+- "rainfall stations in Kuching" then **Show on map** draws the points
 - Export → Shapefile downloads a `.zip` that opens in QGIS
 
 ---
@@ -100,6 +101,21 @@ All optional except `DATABASE_URL`. Set them in Render's dashboard.
 | `ALLOW_RAW_SQL` | `1` locally, `0` in `render.yaml` | whether visitors may type `SELECT …` into the chat box |
 | `SECRET_KEY` | random each restart | signs download links. Set a fixed value so links survive a restart |
 | `PORT` | `5000` | the host sets this itself |
+| `STATEMENT_TIMEOUT_MS` | `20000` | a query running longer than this is cancelled |
+| `DB_POOL_MAX` | `6` | connections kept open per database |
+| `DB_POOL_WAIT` | `10` | seconds a request waits for a free connection |
+| `CONNECT_TIMEOUT` | `10` | seconds to wait when opening a new connection |
+| `ASK_LIMIT_PER_MINUTE` | `40` | questions per visitor per minute. 0 = no limit |
+| `EXPORT_LIMIT_PER_MINUTE` | `10` | downloads per visitor per minute. 0 = no limit |
+| `MAX_EXPORT_ROWS` | `0` (`250000` in `render.yaml`) | refuse whole-table downloads larger than this |
+| `SCHEMA_CACHE_FILE` | a file in the temp directory | where the schema cache is kept between restarts |
+| `SCHEMA_TTL_SECONDS` | `0` | how long a cached schema stays fresh. 0 = until refreshed |
+| `WARM_SCHEMA` | `1` | read every schema in the background at startup |
+| `REFRESH_TOKEN` | unset | enables `POST /api/refresh`. Unset, that endpoint does not exist |
+| `MISS_LOG` | a file in the temp directory | questions the engine could not answer, one JSON line each |
+| `MAP_SIMPLIFY_DEGREES` | `0.0005` | how much shape detail to drop for the map (~55 m) |
+| `MAP_MAX_FEATURES` | `5000` | most features drawn on one map |
+| `LOG_LEVEL` | `INFO` | Python logging level |
 
 Running locally still needs none of them — the defaults are your own
 PostgreSQL, exactly as before.
@@ -136,7 +152,33 @@ their own half-warm copy, so `render.yaml` uses one worker with four threads.
 Follow-ups are per visitor — a cookie keeps two people's conversations apart.
 
 **The free tier sleeps.** After ~15 minutes idle, Render parks the app and the
-next visit takes up to a minute to wake it. The paid tier removes this.
+next visit takes up to a minute to wake it. The paid tier removes this. If you
+are staying on free, point a free uptime monitor (UptimeRobot, Cron-job.org, a
+GitHub Action on a schedule) at `https://<name>.onrender.com/healthz` every 10
+minutes. That endpoint answers without touching the database, so it costs
+nothing but keeps the app awake.
+
+**The schema is read in the background at startup.** Counting rows and indexing
+every text column used to land on whoever asked the first question after a
+restart. Now it happens in a background thread while the page loads, and the
+result is written to `SCHEMA_CACHE_FILE` so a restart reloads it instead of
+re-scanning. If your data changes, either restart or set `REFRESH_TOKEN` and:
+
+```bash
+curl -X POST -H "X-Refresh-Token: your-token" https://<name>.onrender.com/api/refresh
+```
+
+**The map uses OpenStreetMap tiles.** Leaflet itself is served from this repo
+(`static/vendor/`), so the only external request the page makes is for map
+tiles - and the Content-Security-Policy allows nothing else. If you would
+rather it made no external requests at all, drop `img-src` back to `'self'` in
+the `CSP` string in `chatbox.py`; the shapes still draw, just without a
+backdrop.
+
+**Questions that miss are recorded.** Anything the engine could not turn into a
+query is appended to `MISS_LOG` as one JSON line. That file is the only honest
+guide to what the matcher is missing - read it now and then and teach the
+engine the phrasings people actually use.
 
 **If the build runs out of space,** delete the last three lines of
 `requirements.txt` (geopandas, shapely, pyogrio). Everything keeps working

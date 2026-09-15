@@ -1,11 +1,20 @@
 """
-Database Chat - Clean version, no bugs
+Database Chat - ask a PostGIS database questions in plain English.
+
+The page is templates/index.html with static/app.js beside it; everything
+else - reading the schema, matching a question against the real values in the
+data, building the SQL, and the export and map endpoints - is in here.
+
 Run: python chatbox.py
 Open: http://localhost:5000
 """
 
-from flask import Flask, jsonify, Response, request
+from flask import Flask, jsonify, Response, request, render_template, send_from_directory
 import psycopg2
+import psycopg2.pool
+import logging
+import threading
+import time
 import json
 import re
 import csv
@@ -23,6 +32,16 @@ import hashlib
 from urllib.parse import urlparse, parse_qs, unquote
 
 app = Flask(__name__)
+
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s %(name)s %(message)s")
+log = logging.getLogger("database-chat")
+
+# Static files are stamped with this in the page, so a browser can cache them
+# hard and still pick up a new version the moment one ships.
+ASSET_VERSION = "4"
+app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 60 * 60 * 24
 
 # How much of the data we index up front so questions can be matched
 # against real values (see get_schema_info).
@@ -115,19 +134,187 @@ DB_CONFIG = _db_config()
 # database the host's DATABASE_URL points at.
 ADMIN_DB = DB_CONFIG.pop("_default_db", "postgres")
 
+# A query that runs longer than this is a runaway. Without it one bad question
+# holds a worker thread until gunicorn's 120s timeout - a quarter of this
+# site's concurrency - and the visitor stares at a spinner the whole time.
+STATEMENT_TIMEOUT_MS = int(os.environ.get("STATEMENT_TIMEOUT_MS", "20000"))
+DB_CONFIG["options"] = "-c statement_timeout={}".format(STATEMENT_TIMEOUT_MS)
+DB_CONFIG["connect_timeout"] = int(os.environ.get("CONNECT_TIMEOUT", "10"))
+DB_CONFIG["application_name"] = "database-chat"
+
 # Only these databases are offered in the dropdown, in this order.
 # Set to an empty list to show every database on the server again.
 VISIBLE_DATABASES = [d.strip() for d in os.environ.get(
     "VISIBLE_DATABASES", "sarawak basin,subbasin_gis").split(",") if d.strip()]
 
-# Cache schema per database so we don't reload every question
-_schema_cache = {}
+# ============ SCHEMA CACHE ============
+# Reading a schema is not cheap: a COUNT(*) per table, then a DISTINCT scan of
+# every text column so questions can be matched against real values. Without a
+# cache that lands on whoever asks the first question after a restart, so the
+# cache is warmed in the background at startup and written to disk, and a
+# restart reloads it instead of re-scanning.
+
+SCHEMA_CACHE_FILE = os.environ.get("SCHEMA_CACHE_FILE") or os.path.join(
+    tempfile.gettempdir(), "database_chat_schema.json")
+# 0 means the cache never goes stale on its own - refresh it deliberately.
+SCHEMA_TTL = int(os.environ.get("SCHEMA_TTL_SECONDS", "0"))
+
+_schema_cache = {}          # dbname -> {"at": epoch, "tables": [...]}
+_schema_locks = {}
+_schema_meta_lock = threading.Lock()
+
+
+def _schema_lock_for(dbname):
+    with _schema_meta_lock:
+        lock = _schema_locks.get(dbname)
+        if lock is None:
+            lock = _schema_locks[dbname] = threading.Lock()
+        return lock
+
+
+def _cached_schema(dbname):
+    entry = _schema_cache.get(dbname)
+    if not entry:
+        return None
+    if SCHEMA_TTL and (time.time() - entry["at"]) > SCHEMA_TTL:
+        return None
+    return entry["tables"]
+
+
+def _load_schema_from_disk():
+    try:
+        with open(SCHEMA_CACHE_FILE, encoding="utf-8") as f:
+            saved = json.load(f)
+    except Exception:
+        return
+    if not isinstance(saved, dict):
+        return
+    for dbname, entry in saved.items():
+        try:
+            if db_allowed(dbname) and entry.get("tables") is not None:
+                _schema_cache[dbname] = {"at": float(entry.get("at", 0)),
+                                         "tables": entry["tables"]}
+        except Exception:
+            continue
+    if _schema_cache:
+        log.info("schema cache: loaded %d database(s) from %s",
+                 len(_schema_cache), SCHEMA_CACHE_FILE)
+
+
+def _save_schema_to_disk():
+    # Write beside the target and rename, so a crash mid-write cannot leave a
+    # half-written file that the next boot would refuse to parse.
+    tmp = SCHEMA_CACHE_FILE + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(_schema_cache, f)
+        os.replace(tmp, SCHEMA_CACHE_FILE)
+    except Exception as e:
+        log.warning("schema cache: could not save (%s)", e)
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+
+
+# ============ CONNECTION POOL ============
+# Opening a connection to a managed Postgres costs a TCP round trip plus a TLS
+# handshake - 100-300ms to somewhere like Neon, paid again on every question
+# and several times over on an export. The pool pays it once and keeps the
+# connection warm between requests.
+
+POOL_MAX = int(os.environ.get("DB_POOL_MAX", "6"))
+POOL_WAIT = float(os.environ.get("DB_POOL_WAIT", "10"))
+
+_pools = {}
+_pools_lock = threading.Lock()
+
+
+class _Pool(object):
+    """A psycopg2 pool with a doorman.
+
+    psycopg2's own pool raises the moment it is empty; the semaphore makes a
+    caller wait its turn instead, which is what you want when four threads
+    share six connections.
+    """
+
+    def __init__(self, dbname):
+        cfg = dict(DB_CONFIG)
+        cfg["database"] = dbname
+        self.slots = threading.Semaphore(POOL_MAX)
+        self.pool = psycopg2.pool.ThreadedConnectionPool(1, POOL_MAX, **cfg)
+
+    def borrow(self):
+        if not self.slots.acquire(timeout=POOL_WAIT):
+            raise RuntimeError("The database is busy - please try again in a moment.")
+        try:
+            return _PooledConnection(self, self.pool.getconn())
+        except Exception:
+            self.slots.release()
+            raise
+
+    def give_back(self, conn, broken):
+        try:
+            self.pool.putconn(conn, close=broken)
+        except Exception:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        finally:
+            self.slots.release()
+
+
+class _PooledConnection(object):
+    """Looks like a connection, but close() hands it back.
+
+    Every call site here is written as `conn = get_connection(db)` then
+    `conn.close()`, so the pool slots in without touching any of them. A
+    connection that broke, or that comes back still inside a transaction, is
+    dropped rather than passed to the next visitor.
+    """
+
+    def __init__(self, owner, conn):
+        self._owner = owner
+        self._conn = conn
+
+    def __getattr__(self, name):
+        conn = self.__dict__.get("_conn")
+        if conn is None:
+            raise AttributeError("connection already returned to the pool")
+        return getattr(conn, name)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+    def close(self):
+        conn, self._conn = self._conn, None
+        if conn is None:
+            return
+        broken = conn.closed != 0
+        if not broken:
+            try:
+                conn.rollback()
+            except Exception:
+                broken = True
+        self._owner.give_back(conn, broken)
+
+
+def _pool_for(dbname):
+    with _pools_lock:
+        pool = _pools.get(dbname)
+        if pool is None:
+            pool = _Pool(dbname)
+            _pools[dbname] = pool
+        return pool
 
 
 def get_connection(dbname):
-    cfg = dict(DB_CONFIG)
-    cfg["database"] = dbname
-    return psycopg2.connect(**cfg)
+    return _pool_for(dbname).borrow()
 
 
 def get_databases():
@@ -149,11 +336,50 @@ def db_allowed(dbname):
     return (not VISIBLE_DATABASES) or dbname in VISIBLE_DATABASES
 
 
-def get_schema_info(dbname):
-    # Use cache
-    if dbname in _schema_cache:
-        return _schema_cache[dbname]
+def get_schema_info(dbname, refresh=False):
+    """The cached schema, reading it only if nobody has it yet.
 
+    The lock matters: with four threads sharing one worker, several visitors
+    arriving at once would otherwise each kick off the same full scan.
+    """
+    if not refresh:
+        hit = _cached_schema(dbname)
+        if hit is not None:
+            return hit
+    with _schema_lock_for(dbname):
+        if not refresh:
+            hit = _cached_schema(dbname)
+            if hit is not None:
+                return hit
+        tables = _read_schema_info(dbname)
+        _schema_cache[dbname] = {"at": time.time(), "tables": tables}
+        _save_schema_to_disk()
+        return tables
+
+
+def warm_schema_cache():
+    """Read every visible schema up front, in the background.
+
+    Called from a daemon thread at startup so the site is already warm by the
+    time the first visitor has picked a database.
+    """
+    try:
+        names = get_databases()
+    except Exception as e:
+        log.warning("schema warm-up: cannot list databases (%s)", e)
+        return
+    for dbname in names:
+        if _cached_schema(dbname) is not None:
+            continue
+        started = time.time()
+        try:
+            get_schema_info(dbname)
+            log.info("schema warm-up: %s ready in %.1fs", dbname, time.time() - started)
+        except Exception as e:
+            log.warning("schema warm-up: %s failed (%s)", dbname, e)
+
+
+def _read_schema_info(dbname):
     conn = get_connection(dbname)
     try:
         cur = conn.cursor()
@@ -236,11 +462,22 @@ def get_schema_info(dbname):
         cur.close()
     finally:
         conn.close()
-    _schema_cache[dbname] = result
     return result
 
 
 READ_ONLY_PREFIXES = ("SELECT", "WITH", "EXPLAIN")
+
+# A question is only treated as typed SQL when it is actually shaped like SQL.
+# Matching on the first word alone meant "With which division are the most
+# stations?" was answered with "typing SQL is switched off here".
+RE_LOOKS_LIKE_SQL = re.compile(
+    r"""^\s*(?:SELECT\s+.+?\s+FROM\s+|WITH\s+\S+\s+AS\s*[(]|EXPLAIN\s+(?:ANALYZE\s+)?SELECT\s+)""",
+    re.I | re.S)
+
+
+def looks_like_sql(text):
+    return bool(RE_LOOKS_LIKE_SQL.match(text or ""))
+
 
 # Typing raw SELECT statements into the chat box is handy on your own machine
 # and a liability on a public site. Set ALLOW_RAW_SQL=0 there; downloads keep
@@ -316,8 +553,118 @@ GEOJSON_COL = "__geojson"
 # GeoJSON and shapefiles are both written in WGS84 lon/lat. The data here is
 # already 4326, but reprojecting anything else keeps a layer in another CRS
 # from being shipped out mislabelled - a silent error worth a cheap CASE.
-GEOM_AS_GEOJSON = ("ST_AsGeoJSON(CASE WHEN ST_SRID({g}) IN (0, 4326) "
-                   "THEN {g} ELSE ST_Transform({g}, 4326) END) AS {a}")
+GEOM_4326 = ("CASE WHEN ST_SRID({g}) IN (0, 4326) "
+             "THEN {g} ELSE ST_Transform({g}, 4326) END")
+
+GEOM_AS_GEOJSON = "ST_AsGeoJSON(" + GEOM_4326 + ") AS {a}"
+
+# The map only needs what a screen can show. Simplifying and rounding to six
+# decimals (about 10cm) turns a basin boundary from megabytes into kilobytes;
+# the download still gets the full-fidelity geometry.
+GEOM_AS_GEOJSON_MAP = ("ST_AsGeoJSON(ST_SimplifyPreserveTopology("
+                       + GEOM_4326 + ", {tol}), 6) AS {a}")
+
+MAP_SIMPLIFY = os.environ.get("MAP_SIMPLIFY_DEGREES", "0.0005")
+MAP_MAX_FEATURES = int(os.environ.get("MAP_MAX_FEATURES", "5000"))
+
+
+# ---- Download CRS choices, read from the bundled GIS skill ----
+# A shapefile carries its own .prj, so it can be delivered in a projected grid
+# rather than lon/lat - which is what you want before measuring anything, since
+# areas and distances in EPSG:4326 are in degrees.
+#
+# The EPSG codes come from skills/gis-spatial-analysis/references/malaysian_crs.md
+# rather than from memory, on that file's own instruction: the modern GDM2000
+# grids and the legacy Kertau/Timbalai ones have nearly identical projection
+# parameters but different ellipsoids, so a code recalled from memory can be
+# wrong by hundreds of metres without erroring. Parsing the file keeps one
+# verified table as the single source of truth.
+#
+# GeoJSON is deliberately not offered a choice - the format is specified as
+# WGS84 lon/lat, so shipping projected coordinates in it would be malformed.
+
+SKILL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "skills", "gis-spatial-analysis")
+
+CRS_REFERENCE = os.path.join(SKILL_DIR, "references", "malaysian_crs.md")
+
+WGS84 = {"epsg": 4326, "label": "WGS84 lon/lat (EPSG:4326)", "note": "as stored"}
+
+# Sarawak is East Malaysia, so the modern grid is BRSO (3376), not Peninsular
+# RSO (3375) - the two differ only in their projection origin and are easy to
+# confuse. See the skill's quick-reference table.
+PREFERRED_EPSG = 3376
+
+RE_CRS_ROW = re.compile(r'^\|\s*(?!-)(?P<name>[^|]+?)\s*\|\s*\*{0,2}(?P<epsg>\d{4,5})\*{0,2}\s*\|')
+
+
+def _parse_crs_reference(path=CRS_REFERENCE):
+    """Pull (epsg, name) out of the skill's verified CRS tables."""
+    out = []
+    seen = set()
+    try:
+        with open(path, encoding="utf-8") as f:
+            # Tracked at the top heading level only: the legacy datums live
+            # under one "## Legacy datums" heading but are split across several
+            # sub-headings, and every grid below it needs the same warning.
+            legacy_section = False
+            for line in f:
+                s = line.strip()
+                if s.startswith("## ") and not s.startswith("### "):
+                    legacy_section = "legacy" in s.lower()
+                    continue
+                if s.startswith("#"):
+                    continue
+                m = RE_CRS_ROW.match(s)
+                if not m:
+                    continue
+                epsg = int(m.group("epsg"))
+                if epsg in seen:
+                    continue
+                name = m.group("name").strip().strip("*")
+                if not name or name.lower() in ("name", "state", "state grid"):
+                    continue
+                legacy = legacy_section or "Cassini Grid" in name
+                seen.add(epsg)
+                out.append({"epsg": epsg,
+                            "label": "{} (EPSG:{})".format(name, epsg),
+                            "note": "legacy datum" if legacy else ""})
+    except OSError:
+        log.warning("CRS reference not readable at %s - offering WGS84 only", path)
+    return out
+
+
+def crs_choices():
+    """WGS84 first, then the recommended Sarawak grid, then the rest."""
+    choices = _crs_cache.get("all")
+    if choices is None:
+        parsed = _parse_crs_reference()
+        preferred = [c for c in parsed if c["epsg"] == PREFERRED_EPSG]
+        rest = [c for c in parsed if c["epsg"] != PREFERRED_EPSG]
+        for c in preferred:
+            c = dict(c)
+            c["note"] = "recommended for Sarawak"
+        choices = [WGS84] + [dict(c, note="recommended for Sarawak")
+                             for c in preferred] + rest
+        _crs_cache["all"] = choices
+        log.info("CRS choices: %d, read from %s",
+                 len(choices), os.path.basename(CRS_REFERENCE))
+    return choices
+
+
+_crs_cache = {}
+
+
+def crs_allowed(epsg):
+    """Only codes from the verified table - never an arbitrary SRID."""
+    try:
+        epsg = int(epsg)
+    except (TypeError, ValueError):
+        return None
+    for c in crs_choices():
+        if c["epsg"] == epsg:
+            return epsg
+    return None
 
 # smart_ask caps its display query at 100 rows; an explicit "top 5" sets its own
 # limit instead. Only the display cap is dropped on export - "top 5" must stay 5.
@@ -329,6 +676,10 @@ RE_SELECT_FROM = re.compile(r'^\s*SELECT\s+(?P<cols>.+?)\s+FROM\s+(?P<rest>.+)$'
                             re.I | re.S)
 
 RE_FIRST_TABLE = re.compile(r'^"(?P<schema>[^"]+)"\."(?P<table>[^"]+)"')
+
+# "how many stations" is one number, not 345 map features. Without this the
+# geometry gets bolted onto an aggregate and Postgres rejects the whole query.
+RE_AGGREGATE = re.compile(r'\b(?:COUNT|SUM|AVG|MIN|MAX|STRING_AGG|ARRAY_AGG)\s*[(]', re.I)
 
 
 def drop_display_limit(sql):
@@ -356,8 +707,10 @@ def geom_column(columns):
     return None
 
 
-def geom_select(geom):
-    return GEOM_AS_GEOJSON.format(g=quote_ident(geom), a=quote_ident(GEOJSON_COL))
+def geom_select(geom, for_map=False):
+    tpl = GEOM_AS_GEOJSON_MAP if for_map else GEOM_AS_GEOJSON
+    return tpl.format(g=quote_ident(geom), a=quote_ident(GEOJSON_COL),
+                      tol=MAP_SIMPLIFY)
 
 
 def no_geometry(name, fmt):
@@ -365,20 +718,20 @@ def no_geometry(name, fmt):
         name, "a shapefile" if fmt == "shp" else "GeoJSON")
 
 
-def table_export_sql(table, fmt):
+def table_export_sql(table, fmt, for_map=False):
     """SELECT for a whole table - geometry as GeoJSON text, or dropped."""
     geom = geom_column(table["columns"])
     sel = get_display_cols(table["columns"])
     if fmt in GEO_FORMATS:
         if not geom:
             return None, no_geometry(table["table"], fmt)
-        sel = sel + [geom_select(geom)]
+        sel = sel + [geom_select(geom, for_map)]
     return "SELECT {} FROM {}.{}".format(
         ", ".join(sel) or "*",
         quote_ident(table["schema"]), quote_ident(table["table"])), None
 
 
-def answer_export_sql(sql, tables, fmt):
+def answer_export_sql(sql, tables, fmt, for_map=False):
     """Re-point an answer's SQL at an export.
 
     For GeoJSON the geometry has to be added back - smart_ask leaves it out of
@@ -401,6 +754,9 @@ def answer_export_sql(sql, tables, fmt):
     m = RE_SELECT_FROM.match(sql)
     if not m:
         return None, nope
+    if RE_AGGREGATE.search(m.group("cols")):
+        return None, ("That answer is a single figure, not map features - "
+                      "ask for the rows themselves to map them.")
     tm = RE_FIRST_TABLE.match(m.group("rest").strip())
     if not tm:
         return None, nope
@@ -414,7 +770,7 @@ def answer_export_sql(sql, tables, fmt):
 
     # Keep the answer's own column list, so the file holds exactly the columns
     # the table on screen showed - just with the geometry added back.
-    sel = "{}, {}".format(m.group("cols").strip(), geom_select(geom))
+    sel = "{}, {}".format(m.group("cols").strip(), geom_select(geom, for_map))
     return "SELECT {} FROM {}".format(sel, m.group("rest")), None
 
 
@@ -500,9 +856,10 @@ def geojson_body(dbname, sql, cols):
     yield "\n]}\n"
 
 
-def shapefile_zip(dbname, sql, cols, stem):
+def shapefile_zip(dbname, sql, cols, stem, epsg=None):
     """A real shapefile set - .shp/.shx/.dbf/.prj/.cpg - bundled into one zip,
-    because a shapefile is never a single file.
+    because a shapefile is never a single file. `epsg` delivers it in a
+    projected grid instead of lon/lat.
 
     Returns (bytes, error). Unlike the other formats this one is built whole in
     memory: a shapefile has to know its full extent before it can be written.
@@ -532,7 +889,16 @@ def shapefile_zip(dbname, sql, cols, stem):
     if not any(g is not None for g in geoms):
         return None, "Those rows have no geometry, so there is no shape to write."
 
+    # The rows arrive as GeoJSON, which is always WGS84 lon/lat, so the frame
+    # starts there. Reprojecting afterwards goes through pyproj rather than
+    # hand-written parameters - the whole point of not transcribing a grid
+    # definition from memory.
     gdf = gpd.GeoDataFrame(records, geometry=geoms, crs="EPSG:4326")
+    if epsg and int(epsg) != 4326:
+        try:
+            gdf = gdf.to_crs(epsg=int(epsg))
+        except Exception as e:
+            return None, "Could not reproject to EPSG:{} - {}".format(epsg, e)
 
     tmp = tempfile.mkdtemp(prefix="chatbox_shp_")
     try:
@@ -1055,6 +1421,320 @@ def remember(key, table, intent, column=None, filters=None, extra=None,
                      "notes": notes or [], "negate": negate}
 
 
+# ============ SPATIAL QUESTIONS ============
+# "which subbasin is Kapit station in", "stations within 10 km of Sibu",
+# "how many stations in each subbasin" - questions the attribute matcher above
+# answers by accident, with a text filter on a similarly-named column, when the
+# honest answer needs the geometry.
+#
+# Written against the gis-spatial-analysis skill's references/postgis_patterns.md.
+# Three rules from it govern everything below:
+#   1. EPSG:4326 is degrees. ST_DWithin(geom, pt, 10000) there means 10000
+#      DEGREES, not 10 km - so every distance goes through ::geography, which
+#      measures metres on the sphere. (Good enough for rainfall stations; a
+#      cadastral job would want a projected local grid instead.)
+#   2. ST_Contains(polygon, point) for containment, with the polygon side left
+#      untouched so its GiST index still applies.
+#   3. Nearest-neighbour goes through CROSS JOIN LATERAL ... ORDER BY <-> so the
+#      index's KNN support is used instead of a full scan per row.
+
+RE_WITHIN_DIST = re.compile(
+    r'\bwithin\s+(\d+(?:\.\d+)?)\s*(km|kilometre?s?|kilometer?s?|m|metre?s?|meter?s?)\b')
+
+RE_NEAREST = re.compile(r'\b(nearest|closest|next to)\b')
+
+RE_INSIDE = re.compile(
+    r'\b(inside|within|contains?|containing|falls?|located|sits?|belongs?|which|what)\b')
+
+METRES_PER = {"m": 1.0, "metre": 1.0, "metres": 1.0, "meter": 1.0, "meters": 1.0,
+              "km": 1000.0, "kilometre": 1000.0, "kilometres": 1000.0,
+              "kilometer": 1000.0, "kilometers": 1000.0}
+
+SPATIAL_LIMIT = 200
+
+
+def geometry_registry(dbname):
+    """{(schema, table): {"col", "type", "srid"}} straight from PostGIS.
+
+    geometry_columns is the authority on which column holds geometry, what kind
+    of shape it is and which SRID it is stored in - all three of which have to
+    be known before a spatial query can be written honestly.
+    """
+    reg = _geom_registry.get(dbname)
+    if reg is not None:
+        return reg
+    reg = {}
+    res, err = execute_sql(dbname,
+                           "SELECT f_table_schema, f_table_name, f_geometry_column, "
+                           "type, srid FROM geometry_columns")
+    if not err and res:
+        for r in res["rows"]:
+            reg[(r["f_table_schema"], r["f_table_name"])] = {
+                "col": r["f_geometry_column"],
+                "type": (r["type"] or "").upper(),
+                "srid": int(r["srid"] or 0)}
+    _geom_registry[dbname] = reg
+    return reg
+
+
+_geom_registry = {}
+
+
+def geom_info(dbname, table):
+    return geometry_registry(dbname).get((table["schema"], table["table"]))
+
+
+def split_geom_tables(dbname, tables):
+    """The point layer and the polygon layer, if there is exactly one of each."""
+    pts, polys = [], []
+    for t in tables:
+        info = geom_info(dbname, t)
+        if not info:
+            continue
+        if "POINT" in info["type"]:
+            pts.append((t, info))
+        elif "POLYGON" in info["type"]:
+            polys.append((t, info))
+    if len(pts) == 1 and len(polys) == 1:
+        return pts[0], polys[0]
+    return (None, None), (None, None)
+
+
+def qualified(t):
+    return "{}.{}".format(quote_ident(t["schema"]), quote_ident(t["table"]))
+
+
+def aligned_geom(alias, info, target_srid):
+    """The geometry of `alias`, reprojected only if it is not already in the
+    target SRID. PostGIS refuses to compare mismatched SRIDs outright, so this
+    is the difference between a working join and a hard error - and leaving the
+    expression bare when the SRIDs agree keeps the GiST index usable."""
+    col = "{}.{}".format(alias, quote_ident(info["col"]))
+    if info["srid"] and target_srid and info["srid"] != target_srid:
+        return "ST_Transform({}, {})".format(col, target_srid)
+    return col
+
+
+def label_column(table):
+    """The column a person would recognise a row by."""
+    for c in table["columns"]:
+        n = str(c["name"]).lower()
+        if is_text_type(c["type"]) and (n.endswith("_name") or n.endswith("_n")
+                                        or n == "name"):
+            return c["name"]
+    for c in table["columns"]:
+        if is_text_type(c["type"]) and not is_geom_col(c["name"]):
+            return c["name"]
+    return table["columns"][0]["name"]
+
+
+def spatial_descr_cols(table, limit=4):
+    """A few readable columns to show alongside a spatial answer."""
+    out = []
+    for c in table["columns"]:
+        if is_geom_col(c["name"]):
+            continue
+        if is_text_type(c["type"]):
+            out.append(c["name"])
+        if len(out) >= limit:
+            break
+    return out or [table["columns"][0]["name"]]
+
+
+def reference_filter(q_orig, table):
+    """The place named in the question, resolved inside one table - the 'Sibu'
+    in 'stations within 10 km of Sibu'.
+
+    Matched against this table alone rather than against the question's overall
+    hits: a name like 'Kapit' is both a station division and a district, and the
+    overall matcher keeps only the higher-scoring of the two.
+    """
+    _toks, hits, _used = collect_hits(q_orig, [table])
+    for h in hits:
+        if h["kind"] == "value":
+            return h
+    return None
+
+
+def geography_expr(alias, info):
+    """Metres, not degrees. A geographic CRS measures in degrees, so a distance
+    in metres has to go through the geography type - and geography is defined on
+    4326, so anything else is reprojected first."""
+    col = "{}.{}".format(alias, quote_ident(info["col"]))
+    if info["srid"] and info["srid"] != 4326:
+        col = "ST_Transform({}, 4326)".format(col)
+    return col + "::geography"
+
+
+def mentions_table(accepted, table):
+    for h in accepted:
+        t = h.get("table")
+        if t is not None and t["table"] == table["table"]:
+            return True
+    return False
+
+
+def value_in_clause(hit):
+    vals = hit["values"][:MAX_IN_VALUES]
+    return "{} IN ({})".format(
+        quote_ident(hit["column_name"]),
+        ", ".join("'{}'".format(safe_sql_string(v)) for v in vals))
+
+
+def matched_column(q_orig, table):
+    """The column of `table` the question points at, if any."""
+    _t, hits, _u = collect_hits(q_orig, [table])
+    cols = [h for h in hits if h["kind"] == "column"]
+    cols = prefer_names(cols, table, norm_text(q_orig), q_orig)
+    return cols[0]["column"] if cols else None
+
+
+def parse_distance(q):
+    m = RE_WITHIN_DIST.search(q)
+    if not m:
+        return None, None
+    unit = m.group(2).lower()
+    per = METRES_PER.get(unit)
+    if per is None:
+        per = 1000.0 if unit.startswith("k") else 1.0
+    return float(m.group(1)) * per, m.group(0)
+
+
+def spatial_answer(q, q_orig, dbname, tables, accepted, ctx_key):
+    """Answer with geometry, or return None and let the attribute matcher try.
+
+    Only runs where the database really has one point layer and one polygon
+    layer - anything else and a spatial reading would be guesswork.
+    """
+    (pt_t, pt_i), (poly_t, poly_i) = split_geom_tables(dbname, tables)
+    if pt_t is None:
+        return None
+
+    metres, dist_phrase = parse_distance(q)
+    wants_near = bool(RE_NEAREST.search(q))
+    wants_group = bool(RE_GROUP.search(q))
+
+    names_points = mentions_table(accepted, pt_t)
+    names_polys = mentions_table(accepted, poly_t)
+
+    # ---- how many points in each polygon ----
+    # Only spatial when the question actually spans both layers; "stations per
+    # division" is a plain column grouping and must stay one.
+    if wants_group and names_points and names_polys and not metres and not wants_near:
+        gcol = matched_column(q_orig, poly_t) or {"name": label_column(poly_t)}
+        sql = (
+            'SELECT d.{g} AS {galias}, COUNT(s.*) AS total\n'
+            'FROM {poly} d\n'
+            'LEFT JOIN {pts} s ON ST_Contains(d.{pgeom}, {sgeom})\n'
+            'GROUP BY 1 ORDER BY 2 DESC, 1 LIMIT {lim}'
+        ).format(g=quote_ident(gcol["name"]), galias=quote_ident(gcol["name"]),
+                 poly=qualified(poly_t), pts=qualified(pt_t),
+                 pgeom=quote_ident(poly_i["col"]),
+                 sgeom=aligned_geom("s", pt_i, poly_i["srid"]),
+                 lim=SPATIAL_LIMIT)
+        res, err = execute_sql(dbname, sql)
+        if err:
+            return None
+        remember(ctx_key, poly_t, "spatial_group", gcol["name"])
+        pairs = inline_pairs(res["rows"], gcol["name"], "total")
+        return ('**{}** counted inside each **{}**, by where they actually fall: {}'.format(
+                    pt_t["table"], gcol["name"], pairs),
+                sql, res, None)
+
+    # ---- within N km / nearest ----
+    if metres or wants_near:
+        ref_hit = reference_filter(q_orig, poly_t) or reference_filter(q_orig, pt_t)
+        if ref_hit is None:
+            return None
+        ref_t = poly_t if ref_hit["table"]["table"] == poly_t["table"] else pt_t
+        ref_i = poly_i if ref_t is poly_t else pt_i
+
+        # The layer being listed is whichever one is not the reference, unless
+        # the question never mentions it - then it is the points.
+        if ref_t is poly_t:
+            tgt_t, tgt_i = pt_t, pt_i
+        elif names_polys:
+            tgt_t, tgt_i = poly_t, poly_i
+        else:
+            tgt_t, tgt_i = pt_t, pt_i
+
+        ref_geom = quote_ident(ref_i["col"])
+        if ref_i["srid"] and tgt_i["srid"] and ref_i["srid"] != tgt_i["srid"]:
+            ref_geom = "ST_Transform({}, {})".format(ref_geom, tgt_i["srid"])
+        cte = ('WITH ref AS (SELECT ST_Union({rg}) AS g FROM {rt} WHERE {w})\n'
+               ).format(rg=ref_geom, rt=qualified(ref_t), w=value_in_clause(ref_hit))
+
+        cols = ", ".join("t." + quote_ident(c) for c in spatial_descr_cols(tgt_t))
+        tgt_geog = geography_expr("t", tgt_i)
+        ref_geog = "ref.g::geography" if (not tgt_i["srid"] or tgt_i["srid"] == 4326) \
+            else "ST_Transform(ref.g, 4326)::geography"
+        dist = ("ROUND((ST_Distance({}, {}) / 1000.0)::numeric, 2) AS km_away"
+                ).format(tgt_geog, ref_geog)
+        where = ref_hit["display"]
+
+        if metres:
+            sql = cte + (
+                'SELECT {cols}, {dist}\n'
+                'FROM {tgt} t, ref\n'
+                'WHERE ST_DWithin({tg}, {rg}, {m})\n'
+                'ORDER BY km_away LIMIT {lim}'
+            ).format(cols=cols, dist=dist, tgt=qualified(tgt_t),
+                     tg=tgt_geog, rg=ref_geog, m=metres, lim=SPATIAL_LIMIT)
+            lead = '**{}** within {} of **{}**'.format(
+                tgt_t["table"], dist_phrase.replace("within ", ""), where)
+        else:
+            # KNN through LATERAL so the GiST index does the work.
+            sql = cte + (
+                'SELECT {cols}, {dist}\n'
+                'FROM ref\n'
+                'CROSS JOIN LATERAL (\n'
+                '  SELECT * FROM {tgt} ORDER BY {tgeom} <-> ref.g LIMIT {n}\n'
+                ') t\n'
+                'ORDER BY km_away'
+            ).format(cols=cols, dist=dist, tgt=qualified(tgt_t),
+                     tgeom=quote_ident(tgt_i["col"]), n=10)
+            lead = '**{}** nearest to **{}**'.format(tgt_t["table"], where)
+
+        res, err = execute_sql(dbname, sql)
+        if err:
+            return None
+        if not res["rows"]:
+            return ('Nothing in **{}** is that close to **{}**.'.format(
+                tgt_t["table"], where), sql, None, None)
+        remember(ctx_key, tgt_t, "spatial_rows")
+        return (lead + ' - **{}** of them, measured on the ground:'.format(
+            res["count"]), sql, res, where)
+
+    # ---- which polygon is this point in ----
+    if names_points and names_polys and RE_INSIDE.search(q):
+        ref_hit = reference_filter(q_orig, pt_t)
+        if ref_hit is None:
+            return None
+        pcols = ", ".join("d." + quote_ident(c) for c in spatial_descr_cols(poly_t))
+        sql = (
+            'SELECT s.{lab}, {pcols}\n'
+            'FROM {pts} s\n'
+            'JOIN {poly} d ON ST_Contains(d.{pgeom}, {sgeom})\n'
+            'WHERE s.{w}\n'
+            'ORDER BY 1 LIMIT {lim}'
+        ).format(lab=quote_ident(label_column(pt_t)), pcols=pcols,
+                 pts=qualified(pt_t), poly=qualified(poly_t),
+                 pgeom=quote_ident(poly_i["col"]),
+                 sgeom=aligned_geom("s", pt_i, poly_i["srid"]),
+                 w=value_in_clause(ref_hit), lim=SPATIAL_LIMIT)
+        res, err = execute_sql(dbname, sql)
+        if err:
+            return None
+        if not res["rows"]:
+            return ('**{}** does not fall inside any **{}**.'.format(
+                ref_hit["display"], poly_t["table"]), sql, None, None)
+        remember(ctx_key, poly_t, "spatial_rows")
+        return ('Where **{}** falls, by point-in-polygon:'.format(ref_hit["display"]),
+                sql, res, ref_hit["display"])
+
+    return None
+
+
 def smart_ask(question, dbname, tables, session=""):
     ctx_key = (session, dbname)
     q_orig = question.strip()
@@ -1087,6 +1767,16 @@ def smart_ask(question, dbname, tables, session=""):
             return "Error: " + err, sql, None, None
         remember(ctx_key, t, "columns")
         return "Here are the columns in **{}**:".format(t["table"]), sql, res, None
+
+    # ---- SPATIAL ----
+    # Tried before the attribute matcher, because that matcher will happily
+    # answer "which subbasin is station X in" with a text filter on a
+    # similarly-named column and never touch the geometry. Returns None for
+    # anything that is not genuinely spatial, so ordinary questions fall
+    # straight through.
+    spatial = spatial_answer(q, q_orig, dbname, tables, accepted, ctx_key)
+    if spatial is not None:
+        return spatial
 
     # A follow-up with no table of its own carries on with the last one
     if table is None and following:
@@ -1364,470 +2054,171 @@ def smart_ask(question, dbname, tables, session=""):
         res["count"], tname), sql, res, hl
 
 
-# ============ HTML ============
-HTML_PAGE = r"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Database Chat</title>
-<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=DM+Sans:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-<link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css" rel="stylesheet">
-<style>
-:root{--bg:#0a0d12;--bgc:#12161e;--bg2:#181d28;--fg:#e4e8ef;--mt:#5e6d82;--ac:#00d68f;--ad:rgba(0,214,143,.1);--ag:rgba(0,214,143,.2);--ubg:#1a3a2e;--ubr:rgba(0,214,143,.25);--abg:#161b25;--abr:#1e2636;--dn:#ff4757;--wn:#ffaa00;--inf:#4da6ff;--bd:#1c2333;--rd:12px;--ui:'DM Sans',sans-serif;--mn:'JetBrains Mono',monospace}
-*{margin:0;padding:0;box-sizing:border-box}
-body{font-family:var(--ui);background:var(--bg);color:var(--fg);height:100vh;overflow:hidden;display:flex;flex-direction:column}
-.hd{padding:12px 20px;border-bottom:1px solid var(--bd);display:flex;align-items:center;justify-content:space-between;flex-shrink:0;background:var(--bgc);gap:10px;flex-wrap:wrap}
-.hd-l{display:flex;align-items:center;gap:10px}
-.hd-l h1{font-size:1.05rem;font-weight:700;display:flex;align-items:center;gap:9px}
-.hd-l .ic{width:30px;height:30px;background:var(--ad);border:1px solid var(--bd);border-radius:7px;display:flex;align-items:center;justify-content:center;color:var(--ac);font-size:.8rem}
-.hd-r{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-.dsel{padding:6px 28px 6px 10px;background:var(--bg);border:1px solid var(--bd);border-radius:6px;color:var(--fg);font-family:var(--mn);font-size:.78rem;outline:none;cursor:pointer;appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 24 24' fill='none' stroke='%235e6d82' stroke-width='2'%3E%3Cpolyline points='6 9 12 15 18 9'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 8px center}
-.dsel:focus{border-color:var(--ac)}.dsel option{background:var(--bgc);color:var(--fg)}
-.pl{font-size:.68rem;padding:4px 9px;border-radius:5px;font-family:var(--mn);display:flex;align-items:center;gap:4px;background:rgba(0,214,143,.08);color:var(--ac);border:1px solid rgba(0,214,143,.2)}
-.pl .dt{width:6px;height:6px;border-radius:50%;background:currentColor}
-.ms{flex:1;overflow-y:auto;padding:20px;display:flex;flex-direction:column;gap:16px}
-.ms::-webkit-scrollbar{width:5px}.ms::-webkit-scrollbar-thumb{background:var(--bd);border-radius:3px}
-.mg{display:flex;gap:10px;max-width:88%;animation:fi .25s ease}
-.mg.ur{align-self:flex-end;flex-direction:row-reverse}
-.mg.sy{align-self:flex-start}
-@keyframes fi{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
-.av{width:32px;height:32px;border-radius:7px;display:flex;align-items:center;justify-content:center;font-size:.75rem;flex-shrink:0}
-.mg.ur .av{background:var(--ad);color:var(--ac);border:1px solid var(--ubr)}
-.mg.sy .av{background:var(--bg2);color:var(--inf);border:1px solid var(--bd)}
-.bb{padding:13px 16px;border-radius:var(--rd);line-height:1.65;font-size:.88rem}
-.mg.ur .bb{background:var(--ubg);border:1px solid var(--ubr);border-top-right-radius:4px}
-.mg.sy .bb{background:var(--abg);border:1px solid var(--abr);border-top-left-radius:4px}
-.bb p{margin-bottom:6px}.bb p:last-child{margin-bottom:0}
-.bb strong{color:var(--fg);font-weight:600}
-.bb code{background:rgba(0,214,143,.08);color:var(--ac);padding:2px 6px;border-radius:4px;font-family:var(--mn);font-size:.8rem}
-.stg{margin-top:8px}
-.stg button{background:none;border:1px solid var(--bd);color:var(--mt);font-size:.7rem;font-family:var(--mn);padding:3px 10px;border-radius:4px;cursor:pointer}
-.stg button:hover{border-color:var(--mt);color:var(--fg)}
-.stg-hid{display:none;margin-top:8px;background:#0c0f14;border:1px solid var(--bd);border-radius:6px;padding:10px;font-family:var(--mn);font-size:.76rem;color:var(--ac);white-space:pre-wrap;word-break:break-all}
-.tw{max-height:350px;overflow:auto;margin:10px 0;border:1px solid var(--bd);border-radius:8px}
-.tw::-webkit-scrollbar{width:4px;height:4px}.tw::-webkit-scrollbar-thumb{background:var(--bd);border-radius:2px}
-.tb{width:100%;border-collapse:collapse;font-size:.76rem;font-family:var(--mn)}
-.tb th{background:#0c0f14;color:var(--mt);padding:7px 11px;text-align:left;position:sticky;top:0;font-weight:600;text-transform:uppercase;letter-spacing:.3px;font-size:.67rem;white-space:nowrap}
-.tb td{padding:6px 11px;border-top:1px solid var(--bd);white-space:nowrap;max-width:240px;overflow:hidden;text-overflow:ellipsis;color:var(--fg)}
-.tb tr:hover td{background:rgba(0,214,143,.03)}
-.tb .nl{color:var(--mt);font-style:italic}
-.tb .hl{background:rgba(0,214,143,.15);color:var(--ac);font-weight:600}
-.rc{font-size:.72rem;color:var(--mt);margin-top:5px;font-style:italic}
-.xp{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-top:9px}
-.xp-l{font-size:.66rem;color:var(--mt);font-family:var(--mn);text-transform:uppercase;letter-spacing:.5px;margin-right:2px}
-.xb{padding:4px 10px;background:var(--bgc);border:1px solid var(--bd);border-radius:5px;color:var(--fg);font-family:var(--mn);font-size:.7rem;cursor:pointer;display:inline-flex;align-items:center;gap:5px;transition:all .2s}
-.xb:hover{border-color:var(--ac);color:var(--ac);background:var(--ad)}
-.xb:disabled{opacity:.5;cursor:progress}
-.xb i{font-size:.66rem;color:var(--ac)}
-.xrow{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-bottom:9px}
-.xrow .xn{font-family:var(--mn);font-size:.76rem;color:var(--fg);min-width:170px}
-.btn-exp{padding:6px 11px;background:var(--bg);border:1px solid var(--bd);border-radius:6px;color:var(--fg);font-family:var(--mn);font-size:.78rem;cursor:pointer;display:flex;align-items:center;gap:6px;transition:all .2s}
-.btn-exp:hover:not(:disabled){border-color:var(--ac);color:var(--ac)}
-.btn-exp:disabled{opacity:.35;cursor:not-allowed}
-.qa{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
-.qb{padding:7px 13px;background:var(--bgc);border:1px solid var(--bd);border-radius:7px;color:var(--fg);font-family:var(--ui);font-size:.78rem;cursor:pointer;transition:all .2s;display:flex;align-items:center;gap:6px}
-.qb:hover{border-color:var(--ac);background:var(--ad);color:var(--ac)}
-.qb i{font-size:.7rem;color:var(--ac)}
-.scb{background:#0c0f14;border:1px solid var(--bd);border-radius:8px;margin:8px 0;overflow:hidden}
-.scb-h{padding:7px 12px;background:rgba(77,166,255,.05);border-bottom:1px solid var(--bd);font-size:.68rem;font-family:var(--mn);color:var(--inf);text-transform:uppercase;letter-spacing:.5px}
-.scb-b{padding:10px 12px;font-family:var(--mn);font-size:.76rem;line-height:1.7;color:var(--mt)}
-.scb-b .tn{color:var(--fg);font-weight:600}.scb-b .cn{color:var(--ac)}.scb-b .ct{opacity:.5}.scb-b .rn{color:var(--wn)}
-.tp-ind{display:flex;gap:4px;padding:6px 0}
-.tp-ind span{width:6px;height:6px;background:var(--mt);border-radius:50%;animation:bn 1.4s infinite ease-in-out}
-.tp-ind span:nth-child(2){animation-delay:.2s}.tp-ind span:nth-child(3){animation-delay:.4s}
-@keyframes bn{0%,80%,100%{transform:scale(.6);opacity:.4}40%{transform:scale(1);opacity:1}}
-.ip{padding:12px 20px;border-top:1px solid var(--bd);background:var(--bgc);flex-shrink:0}
-.ip-r{display:flex;gap:8px;align-items:flex-end}
-.ip-r textarea{flex:1;padding:11px 14px;background:var(--bg);border:1px solid var(--bd);border-radius:var(--rd);color:var(--fg);font-family:var(--ui);font-size:.9rem;resize:none;outline:none;transition:border-color .2s;min-height:44px;max-height:120px;line-height:1.5}
-.ip-r textarea:focus{border-color:var(--ac)}.ip-r textarea::placeholder{color:var(--mt)}
-.btn-send{width:44px;height:44px;border-radius:var(--rd);border:1px solid var(--ac);background:var(--ac);color:#0a0d12;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:.95rem;transition:all .2s;flex-shrink:0}
-.btn-send:hover{background:#00c080;border-color:#00c080;transform:scale(1.04)}
-.btn-send:disabled{opacity:.3;cursor:not-allowed;transform:none}
-.ip-h{text-align:center;font-size:.68rem;color:var(--mt);margin-top:5px;opacity:.5}
-.wc{text-align:center;padding:30px 20px;max-width:520px;margin:auto}
-.wc .wi{font-size:2.5rem;color:var(--bd);margin-bottom:14px}
-.wc h2{font-size:1.15rem;font-weight:700;margin-bottom:8px}
-.wc p{color:var(--mt);line-height:1.6;margin-bottom:16px;font-size:.86rem}
-.wc .arw{font-size:1.1rem;color:var(--ac);margin-bottom:6px;animation:ab 1.5s infinite}
-@keyframes ab{0%,100%{transform:translateY(0)}50%{transform:translateY(-5px)}}
-.er{color:var(--dn);font-size:.82rem;display:flex;align-items:flex-start;gap:7px;margin-top:6px}
-@media(max-width:640px){.hd{padding:10px 12px}.hd-l h1{font-size:.9rem}.ms{padding:12px}.mg{max-width:96%}.ip{padding:10px 12px}}
-</style>
-</head>
-<body>
+# ============ THE PAGE ============
+# The page itself lives in templates/index.html, with static/app.css and
+# static/app.js beside it. It used to be one long string in this file, which
+# meant no syntax highlighting, no caching, and a Content-Security-Policy that
+# had to allow inline script. Now the browser caches all three and the policy
+# below can forbid inline script outright.
 
-<div class="hd">
-  <div class="hd-l"><h1><span class="ic"><i class="fas fa-database"></i></span> Database Chat</h1></div>
-  <div class="hd-r">
-    <select class="dsel" id="dbSel" onchange="onDbChange()"><option value="">Loading...</option></select>
-    <button class="btn-exp" id="expBtn" onclick="showExport()" disabled title="Download data from this database"><i class="fas fa-download"></i> Export</button>
-    <span class="pl" id="connSt"><span class="dt"></span>Connected</span>
-    <span class="pl"><i class="fas fa-lock-open" style="font-size:.5rem"></i> Free</span>
-  </div>
-</div>
 
-<div class="ms" id="msgBox">
-  <div class="wc" id="welcome">
-    <div class="arw"><i class="fas fa-arrow-up"></i></div>
-    <p style="color:var(--ac);font-weight:600;margin-bottom:10px">First: select a database from the dropdown above</p>
-    <div class="wi"><i class="fas fa-comments"></i></div>
-    <h2>Ask about your data in plain English</h2>
-    <p>Just type normally - no SQL, and spelling doesn't have to be perfect.<br>
-    Examples: "how many stations at kucing", "stations per division", "list all districts"</p>
-  </div>
-</div>
+# ============ PUBLIC-FACING GUARDS ============
+# Everything below this line assumes the visitor is a stranger: their questions
+# are rate limited, their errors say nothing about the database internals, and
+# the browser is told exactly what the page is allowed to load.
 
-<div class="ip">
-  <div class="ip-r">
-    <textarea id="inp" placeholder="Select a database first..." rows="1" onkeydown="onKey(event)"></textarea>
-    <button class="btn-send" id="sendBtn" onclick="doSend()" disabled><i class="fas fa-paper-plane"></i></button>
-  </div>
-  <div class="ip-h">Enter to send</div>
-</div>
+# Per IP, per minute. 0 switches a limit off.
+ASK_LIMIT = int(os.environ.get("ASK_LIMIT_PER_MINUTE", "40"))
+EXPORT_LIMIT = int(os.environ.get("EXPORT_LIMIT_PER_MINUTE", "10"))
 
-<script>
-var curDb = null;
-var busy = false;
-var curTables = [];   // schema of the selected database, for the export buttons
-var expJobs = [];     // the SQL behind each answer, referenced by index
-var inp = document.getElementById('inp');
+# Refuse to build a download bigger than this many rows - 0 means no ceiling.
+# Whole-table downloads are the expensive ones, and the row count is already in
+# the schema cache, so the refusal costs nothing.
+MAX_EXPORT_ROWS = int(os.environ.get("MAX_EXPORT_ROWS", "0"))
 
-inp.addEventListener('input', function() {
-  inp.style.height = 'auto';
-  inp.style.height = Math.min(inp.scrollHeight, 120) + 'px';
-});
+# Lets an operator rebuild the schema cache without a redeploy. Unset means the
+# endpoint is closed - it is a full re-scan, not something to leave open.
+REFRESH_TOKEN = os.environ.get("REFRESH_TOKEN", "").strip()
 
-document.addEventListener('DOMContentLoaded', function() {
-  loadDbs();
-  inp.focus();
-});
+# Long enough for any real question, short enough that nobody can post a novel.
+MAX_QUESTION_CHARS = 500
 
-function loadDbs() {
-  var sel = document.getElementById('dbSel');
-  fetch('/api/databases').then(function(r) { return r.json(); }).then(function(d) {
-    if (d.error) throw new Error(d.error);
-    sel.innerHTML = '';
-    var ph = document.createElement('option');
-    ph.value = ''; ph.textContent = '-- Select database --';
-    sel.appendChild(ph);
-    (d.databases || []).forEach(function(db) {
-      var o = document.createElement('option');
-      o.value = db; o.textContent = db;
-      sel.appendChild(o);
-    });
-  }).catch(function(e) {
-    sel.innerHTML = '<option value="">Error</option>';
-  });
-}
+# The signed SQL a page sends back. Generous, but not a place to paste a book.
+MAX_EXPORT_SQL_CHARS = 20000
 
-function onDbChange() {
-  var db = document.getElementById('dbSel').value;
-  curDb = db;
-  curTables = [];
-  expJobs = [];
-  document.getElementById('sendBtn').disabled = !db;
-  document.getElementById('expBtn').disabled = true;
-  document.getElementById('connSt').innerHTML = db
-    ? '<span class="dt"></span>' + esc(db)
-    : '<span class="dt"></span>Connected';
-  if (!db) { inp.placeholder = 'Select a database first...'; return; }
-  inp.placeholder = 'Ask anything about your data...';
-  document.getElementById('msgBox').innerHTML = '';
-  showTyping();
-  fetch('/api/schema?db=' + encodeURIComponent(db)).then(function(r) { return r.json(); }).then(function(d) {
-    if (d.error) throw new Error(d.error);
-    hideTyping();
-    curTables = d.tables || [];
-    document.getElementById('expBtn').disabled = !curTables.length;
-    showSchema(d.tables);
-  }).catch(function(e) {
-    hideTyping();
-    addMsg('sy', '', '<div class="er"><i class="fas fa-exclamation-circle"></i> ' + esc(e.message) + '</div>');
-  });
-}
+# Questions the engine could not turn into a query. This list is the only
+# honest guide to what the matcher is missing - it cannot be guessed from here.
+MISS_LOG = os.environ.get("MISS_LOG") or os.path.join(
+    tempfile.gettempdir(), "database_chat_misses.log")
 
-function showSchema(tables) {
-  if (!tables || !tables.length) {
-    addMsg('sy', '', '<p>Database <strong>' + esc(curDb) + '</strong> is empty - it has no tables yet, '
-      + 'so there is nothing to ask about.</p><p style="color:var(--mt)">Import your data into it '
-      + '(QGIS <em>Export &rarr; PostGIS</em>, <code>shp2pgsql</code>, or <code>ogr2ogr</code>), '
-      + 'then pick the database again to reload.</p>');
-    return;
-  }
-  var h = '<p>Database <strong>' + esc(curDb) + '</strong> is ready. Ask in plain English - no SQL, and typos are fine.<br>'
-        + 'You get a short answer; say <strong>"show them"</strong> when you want the full table, '
-        + 'or <strong>"what about Miri"</strong> to carry on.</p>';
-  h += '<div class="scb"><div class="scb-h">What\'s in here</div><div class="scb-b">';
-  tables.forEach(function(t) {
-    h += '<div style="margin-bottom:8px"><span class="tn">' + esc(t.table) + '</span> <span class="rn">(' + t.rows + ' rows)</span><br>';
-    t.columns.forEach(function(c) {
-      h += '&nbsp;&nbsp;<span class="cn">' + esc(c.name) + '</span> <span class="ct">' + esc(c.type) + '</span><br>';
-    });
-    var f = t.filterable || {};
-    Object.keys(f).forEach(function(k) {
-      var v = f[k];
-      h += '&nbsp;&nbsp;<span class="ct">you can ask by</span> <span class="cn">' + esc(k) + '</span><span class="ct">: '
-         + esc(v.slice(0, 6).join(', ')) + (v.length > 6 ? ', ...' : '') + '</span><br>';
-    });
-    h += '</div>';
-  });
-  h += '</div></div><p>Try asking:</p><div class="qa">';
+# The page loads nothing from anywhere else: its script, styles, icons and the
+# map library are all served from here. Map tiles are the one exception, and
+# they are images only.
+CSP = ("default-src 'none'; "
+       "base-uri 'none'; "
+       "form-action 'none'; "
+       "frame-ancestors 'none'; "
+       "script-src 'self'; "
+       # Leaflet positions its tiles by writing style properties, so styles
+       # cannot be locked down the way scripts can. Scripts are the half that
+       # matters for XSS, and those load from here only.
+       "style-src 'self' 'unsafe-inline'; "
+       "font-src 'self'; "
+       "img-src 'self' data: https://*.tile.openstreetmap.org; "
+       "connect-src 'self'")
 
-  // Build examples from the real data so they always work
-  var qs = [];
-  tables.forEach(function(t) {
-    qs.push(['fa-table', 'Show ' + t.table, 'show all ' + t.table]);
-    var f = t.filterable || {};
-    var keys = Object.keys(f);
-    if (keys.length) {
-      var k = keys[0], v = f[k][0];
-      qs.push(['fa-filter', t.table + ' in ' + v, t.table + ' in ' + v]);
-      qs.push(['fa-chart-simple', 'Count per ' + k, 'how many ' + t.table + ' per ' + k]);
-      qs.push(['fa-trophy', 'Which ' + k + ' has most', 'which ' + k + ' has the most ' + t.table]);
-      qs.push(['fa-list-ul', 'List all ' + k, 'list all ' + k]);
-    } else {
-      qs.push(['fa-calculator', 'Count ' + t.table, 'how many ' + t.table]);
-    }
-  });
-  qs.slice(0, 12).forEach(function(x) {
-    h += '<button class="qb" onclick="quickQ(this.dataset.q)" data-q="' + esc(x[2]) + '">'
-       + '<i class="fas ' + x[0] + '"></i> ' + esc(x[1]) + '</button>';
-  });
-  h += '</div>';
-  addMsg('sy', '', h);
-}
+GENERIC_ERROR = "Something went wrong at our end. Please try again."
 
-function onKey(e) { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); doSend(); } }
-function quickQ(q) { inp.value = q; doSend(); }
+_rate_state = {}
+_rate_lock = threading.Lock()
+_miss_lock = threading.Lock()
 
-function doSend() {
-  var txt = inp.value.trim();
-  if (!txt || busy || !curDb) return;
-  var w = document.getElementById('welcome');
-  if (w) w.remove();
-  addMsg('ur', txt);
-  inp.value = ''; inp.style.height = 'auto';
-  busy = true;
-  document.getElementById('sendBtn').disabled = true;
-  showTyping();
-  fetch('/api/ask', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ database: curDb, question: txt })
-  }).then(function(r) { return r.json(); }).then(function(d) {
-    hideTyping();
-    if (d.error) {
-      addMsg('sy', '', fmt(d.error));
-    } else {
-      var h = '';
-      if (d.reply) h += fmt(d.reply);
-      if (d.data && d.data.rows && d.data.rows.length > 0) {
-        h += buildTbl(d.data, d.highlight);
-        h += exportBar(d.sql, d.sig);
-      }
-      if (d.sql) {
-        h += '<div class="stg"><button onclick="var el=this.nextElementSibling;el.style.display=el.style.display===\'none\'?\'block\':\'none\';this.textContent=el.style.display===\'none\'?\'View SQL\':\'Hide SQL\'">View SQL</button><div class="stg-hid">' + esc(d.sql) + '</div></div>';
-      }
-      addMsg('sy', '', h);
-    }
-  }).catch(function(e) {
-    hideTyping();
-    addMsg('sy', '', '<div class="er"><i class="fas fa-exclamation-circle"></i> ' + esc(e.message) + '</div>');
-  }).then(function() {
-    busy = false;
-    document.getElementById('sendBtn').disabled = !curDb;
-    inp.focus();
-  });
-}
 
-function fmt(t) {
-  return esc(t)
-    .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
-    .replace(/\*([^*\n]+)\*/g, '<em>$1</em>')
-    .replace(/`([^`]+)`/g, '<code>$1</code>')
-    .replace(/^\s*-\s+/gm, '&bull; ')   // only a dash starting a line is a bullet
-    .replace(/\n/g, '<br>');
-}
+def client_ip():
+    fwd = request.headers.get("X-Forwarded-For", "")
+    return fwd.split(",")[0].strip() or request.remote_addr or "unknown"
 
-function buildTbl(data, hl) {
-  var cols = data.columns || [];
-  var rows = data.rows || [];
-  var show = rows.slice(0, 100);
-  var hv = hl ? hl.toLowerCase() : null;
-  var h = '<div class="tw"><table class="tb"><thead><tr>';
-  cols.forEach(function(c) { h += '<th>' + esc(c) + '</th>'; });
-  h += '</tr></thead><tbody>';
-  show.forEach(function(row) {
-    h += '<tr>';
-    cols.forEach(function(c) {
-      var v = row[c];
-      if (v === null || v === undefined) {
-        h += '<td class="nl">NULL</td>';
-      } else {
-        var s = String(v);
-        var isH = hv && s.toLowerCase().indexOf(hv) !== -1;
-        h += '<td title="' + esc(s) + '"' + (isH ? ' class="hl"' : '') + '>' + esc(s.length > 120 ? s.substring(0, 120) + '...' : s) + '</td>';
-      }
-    });
-    h += '</tr>';
-  });
-  h += '</tbody></table></div>';
-  h += '<div class="rc">Showing ' + show.length + ' of ' + rows.length + ' rows';
-  if (hv) h += ' &middot; matched: <span style="color:var(--ac)">"' + esc(hl) + '"</span>';
-  h += '</div>';
-  return h;
-}
 
-// ---- Download / export ----
+def rate_ok(bucket, per_minute):
+    """A leaky bucket per visitor. One process, one worker, so a dict does."""
+    if per_minute <= 0:
+        return True
+    key = (client_ip(), bucket)
+    now = time.time()
+    with _rate_lock:
+        tokens, last = _rate_state.get(key, (float(per_minute), now))
+        tokens = min(per_minute, tokens + (now - last) * per_minute / 60.0)
+        if tokens < 1:
+            _rate_state[key] = (tokens, now)
+            return False
+        _rate_state[key] = (tokens - 1.0, now)
+        if len(_rate_state) > 5000:
+            for k, (_, seen) in list(_rate_state.items()):
+                if now - seen > 300:
+                    _rate_state.pop(k, None)
+        return True
 
-function xbtn(icon, label, call) {
-  return '<button class="xb" onclick="' + call + '"><i class="fas ' + icon + '"></i>' + label + '</button>';
-}
 
-function tableHasGeom(name) {
-  var want = String(name).toLowerCase();
-  for (var i = 0; i < curTables.length; i++) {
-    var t = curTables[i];
-    if (t.table.toLowerCase() !== want) continue;
-    for (var j = 0; j < t.columns.length; j++) {
-      var n = t.columns[j].name.toLowerCase();
-      if (n.indexOf('geom') !== -1 || n === 'shape' || n === 'the_geom') return true;
-    }
-  }
-  return false;
-}
+def too_many(what):
+    return jsonify({"error": "That is a lot of {} at once - "
+                             "give it a moment and try again.".format(what)}), 429
 
-// GeoJSON only makes sense for plain rows straight out of a table with a
-// geometry column - a "count per district" summary has nothing to draw.
-function canGeoJson(sql) {
-  if (!sql || /\bGROUP\s+BY\b/i.test(sql) || /^\s*SELECT\s+DISTINCT\b/i.test(sql)) return false;
-  var m = /\bFROM\s+"([^"]+)"\."([^"]+)"/i.exec(sql);
-  return m ? tableHasGeom(m[2]) : false;
-}
 
-function exportBar(sql, sig) {
-  if (!sql) return '';
-  var i = expJobs.push({sql: sql, sig: sig || ''}) - 1;
-  var h = '<div class="xp"><span class="xp-l">Download</span>'
-        + xbtn('fa-file-csv', 'CSV', 'expAnswer(this,' + i + ",'csv')")
-        + xbtn('fa-file-code', 'JSON', 'expAnswer(this,' + i + ",'json')");
-  if (canGeoJson(sql)) {
-    h += xbtn('fa-map-location-dot', 'GeoJSON', 'expAnswer(this,' + i + ",'geojson')")
-       + xbtn('fa-layer-group', 'Shapefile', 'expAnswer(this,' + i + ",'shp')");
-  }
-  return h + '</div>';
-}
+def oops(exc, public=GENERIC_ERROR):
+    """Log what actually happened, tell the visitor something safe.
 
-function expAnswer(btn, i, fmtName) {
-  var job = expJobs[i];
-  runExport(btn, { db: curDb, sql: job.sql, sig: job.sig, fmt: fmtName });
-}
+    Postgres errors name schemas, roles and columns; a stranger on the public
+    site has no business reading them, and an attacker would enjoy them.
+    """
+    if isinstance(exc, RuntimeError):        # our own "the database is busy"
+        return str(exc)
+    log.exception("request failed: %s %s", request.method, request.path)
+    return public
 
-function expTable(btn, i, fmtName) {
-  runExport(btn, { db: curDb, table: curTables[i].table, fmt: fmtName });
-}
 
-function showExport() {
-  if (!curDb || !curTables.length) return;
-  var w = document.getElementById('welcome');
-  if (w) w.remove();
-  var h = '<p>Download from <strong>' + esc(curDb) + '</strong> - the whole table, in the format you want.</p>';
-  curTables.forEach(function(t, i) {
-    h += '<div class="xrow"><span class="xn">' + esc(t.table)
-       + ' <span style="color:var(--mt)">(' + t.rows + ' rows)</span></span>'
-       + xbtn('fa-file-csv', 'CSV', 'expTable(this,' + i + ",'csv')")
-       + xbtn('fa-file-code', 'JSON', 'expTable(this,' + i + ",'json')");
-    if (tableHasGeom(t.table)) {
-      h += xbtn('fa-map-location-dot', 'GeoJSON', 'expTable(this,' + i + ",'geojson')")
-         + xbtn('fa-layer-group', 'Shapefile', 'expTable(this,' + i + ",'shp')");
-    }
-    h += '</div>';
-  });
-  h += '<p style="color:var(--mt);font-size:.8rem">Shapefile arrives as a .zip - '
-     + '.shp, .shx, .dbf and .prj together, ready to unzip straight into QGIS.<br>'
-     + 'Only want part of it? Ask a question first - every answer comes with its own '
-     + 'download buttons.</p>';
-  addMsg('sy', '', h);
-}
+def db_error_text(err):
+    """A failed generated query. Locally the raw text helps; publicly it leaks."""
+    log.warning("query failed: %s", err)
+    if ALLOW_RAW_SQL:
+        return "Error: " + str(err)
+    return "That question could not be answered against this database."
 
-function runExport(btn, params) {
-  var qs = Object.keys(params).map(function(k) {
-    return encodeURIComponent(k) + '=' + encodeURIComponent(params[k]);
-  }).join('&');
-  var label = btn ? btn.innerHTML : '';
-  if (btn) { btn.disabled = true; btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i>'; }
-  fetch('/api/export?' + qs).then(function(r) {
-    // Only the status says whether this is a file or a refusal - a successful
-    // JSON export is application/json too, so the content type cannot decide.
-    if (!r.ok) {
-      return r.text().then(function(t) {
-        var msg = 'Export failed';
-        try { msg = JSON.parse(t).error || msg; } catch (err) {}
-        throw new Error(msg);
-      });
-    }
-    var name = 'export';
-    var m = /filename="([^"]+)"/.exec(r.headers.get('Content-Disposition') || '');
-    if (m) name = m[1];
-    return r.blob().then(function(b) { saveBlob(b, name); });
-  }).catch(function(e) {
-    addMsg('sy', '', '<div class="er"><i class="fas fa-exclamation-circle"></i> ' + esc(e.message) + '</div>');
-  }).then(function() {
-    if (btn) { btn.disabled = false; btn.innerHTML = label; }
-  });
-}
 
-function saveBlob(blob, name) {
-  var url = URL.createObjectURL(blob);
-  var a = document.createElement('a');
-  a.href = url;
-  a.download = name;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  setTimeout(function() { URL.revokeObjectURL(url); }, 1000);
-}
+def record_miss(dbname, question):
+    """Note a question that got the help text instead of an answer."""
+    log.info("unanswered [%s]: %s", dbname, question)
+    line = json.dumps({"at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                       "db": dbname, "question": question}, ensure_ascii=False)
+    try:
+        with _miss_lock:
+            with open(MISS_LOG, "a", encoding="utf-8") as f:
+                f.write(line + chr(10))
+    except Exception:
+        pass          # a log that cannot be written must never break an answer
 
-function addMsg(role, text, html) {
-  var box = document.getElementById('msgBox');
-  var div = document.createElement('div');
-  div.className = 'mg ' + role;
-  var ic = role === 'ur' ? 'fa-user' : 'fa-robot';
-  div.innerHTML = '<div class="av"><i class="fas ' + ic + '"></i></div><div class="bb">' + (html || '<p>' + esc(text).replace(/\n/g, '<br>') + '</p>') + '</div>';
-  box.appendChild(div);
-  box.scrollTop = box.scrollHeight;
-  return div;
-}
 
-function showTyping() {
-  var box = document.getElementById('msgBox');
-  var div = document.createElement('div');
-  div.className = 'mg sy';
-  div.id = 'typEl';
-  div.innerHTML = '<div class="av"><i class="fas fa-robot"></i></div><div class="bb"><div class="tp-ind"><span></span><span></span><span></span></div></div>';
-  box.appendChild(div);
-  box.scrollTop = box.scrollHeight;
-}
+def mappable(sql, tables):
+    """Can the rows behind this answer be drawn? Same test the export uses."""
+    if not sql:
+        return False
+    try:
+        built, err = answer_export_sql(sql, tables, "geojson", for_map=True)
+        return bool(built) and not err
+    except Exception:
+        return False
 
-function hideTyping() {
-  var el = document.getElementById('typEl');
-  if (el) el.remove();
-}
 
-function esc(s) {
-  var d = document.createElement('div');
-  d.textContent = s;
-  return d.innerHTML;
-}
-</script>
-</body>
-</html>"""
+@app.after_request
+def security_headers(resp):
+    resp.headers.setdefault("Content-Security-Policy", CSP)
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("X-Frame-Options", "DENY")
+    resp.headers.setdefault("Referrer-Policy", "no-referrer")
+    resp.headers.setdefault("Permissions-Policy",
+                            "geolocation=(), microphone=(), camera=()")
+    if request.is_secure:
+        resp.headers.setdefault("Strict-Transport-Security",
+                                "max-age=31536000; includeSubDomains")
+    return resp
 
 
 @app.route('/')
 def index():
-    return Response(HTML_PAGE, mimetype='text/html; charset=utf-8')
+    return render_template("index.html", v=ASSET_VERSION,
+                           raw_sql=1 if ALLOW_RAW_SQL else 0)
+
+
+@app.route('/favicon.ico')
+def favicon():
+    return send_from_directory(app.static_folder, "favicon.svg",
+                               mimetype="image/svg+xml")
+
+
+@app.route('/robots.txt')
+def robots():
+    # The data is public; the endpoints that cost money are not worth crawling.
+    body = chr(10).join(["User-agent: *", "Disallow: /api/", ""])
+    return Response(body, mimetype="text/plain")
 
 
 @app.route('/api/databases')
@@ -1835,7 +2226,7 @@ def list_databases():
     try:
         return jsonify({"databases": get_databases()})
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": oops(e, "Cannot reach the database right now.")}), 503
 
 
 @app.route('/api/schema')
@@ -1852,11 +2243,12 @@ def get_schema():
             "table": t["table"],
             "rows": t["rows"],
             "columns": t["columns"],
-            "filterable": {k: v for k, v in t.get("values", {}).items() if 1 < len(v) <= 25}
+            "filterable": {k: v for k, v in t.get("values", {}).items() if 1 < len(v) <= 25},
+            "geometry": bool(geom_column(t["columns"]))
         } for t in get_schema_info(db)]
         return jsonify({"tables": payload})
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": oops(e, "Cannot read that database right now.")}), 503
 
 
 SESSION_COOKIE = "chatsid"
@@ -1874,9 +2266,12 @@ def with_session(payload, sid, status=200):
 
 @app.route('/api/ask', methods=['POST'])
 def ask():
+    if not rate_ok("ask", ASK_LIMIT):
+        return too_many("questions")
+
     data = request.get_json(silent=True) or {}
     db = data.get("database", "")
-    question = (data.get("question") or "").strip()
+    question = (data.get("question") or "").strip()[:MAX_QUESTION_CHARS]
     sid = request.cookies.get(SESSION_COOKIE) or uuid.uuid4().hex
 
     if not db:
@@ -1887,13 +2282,14 @@ def ask():
         return with_session({"error": "Empty question"}, sid, 400)
 
     # Raw SQL
-    if question.upper().startswith(READ_ONLY_PREFIXES):
+    if looks_like_sql(question):
         if not ALLOW_RAW_SQL:
             return with_session({"reply": "Typing SQL is switched off here - ask in plain English instead.",
                                  "sql": None, "data": None, "highlight": None}, sid)
         res, err = execute_sql(db, question)
         if err:
-            return with_session({"reply": "SQL Error: " + err, "sql": question, "data": None, "highlight": None}, sid)
+            return with_session({"reply": db_error_text(err), "sql": question,
+                                 "data": None, "highlight": None}, sid)
         if not res or not res["rows"]:
             return with_session({"reply": "Query returned 0 rows.", "sql": question, "data": None, "highlight": None}, sid)
         return with_session({"reply": 'Query returned **{}** rows:'.format(res["count"]),
@@ -1904,9 +2300,14 @@ def ask():
         tables = get_schema_info(db)
         reply, sql, result, highlight = smart_ask(question, db, tables, sid)
     except Exception as e:
-        return with_session({"error": str(e)}, sid, 500)
+        return with_session({"error": oops(e)}, sid, 500)
+
+    if sql is None and result is None and not RE_OVERVIEW.search(norm_text(question)):
+        record_miss(db, question)
+
     return with_session({"reply": reply, "sql": sql, "sig": sign_sql(sql) if sql else None,
-                         "data": result, "highlight": highlight}, sid)
+                         "data": result, "highlight": highlight,
+                         "mappable": mappable(sql, tables)}, sid)
 
 
 @app.route('/api/export')
@@ -1916,11 +2317,16 @@ def export():
     Either ?table=<name> for a whole table, or ?sql=<answer sql> for the rows
     behind an answer. Read-only queries only, same as /api/ask.
     """
+    if not rate_ok("export", EXPORT_LIMIT):
+        return too_many("downloads")
+
     db = request.args.get('db', '')
     fmt = (request.args.get('fmt') or 'csv').lower()
     table_name = (request.args.get('table') or '').strip()
     sql = (request.args.get('sql') or '').strip()
 
+    if len(sql) > MAX_EXPORT_SQL_CHARS:
+        return jsonify({"error": "That query is too long."}), 400
     if not db:
         return jsonify({"error": "No database selected"}), 400
     if not db_allowed(db):
@@ -1937,6 +2343,14 @@ def export():
             table = find_table(tables, table_name)
             if not table:
                 return jsonify({"error": "No table called " + table_name}), 404
+            if MAX_EXPORT_ROWS and table["rows"] > MAX_EXPORT_ROWS:
+                # Better an honest refusal than a file that is quietly
+                # truncated - a half table looks exactly like a whole one.
+                return jsonify({"error": (
+                    "{} has {:,} rows, more than this site will build in one "
+                    "download ({:,}). Ask a question to narrow it down first - "
+                    "every answer has its own download buttons.".format(
+                        table["table"], table["rows"], MAX_EXPORT_ROWS))}), 413
             out_sql, err = table_export_sql(table, fmt)
             stem = table["table"]
         else:
@@ -1961,9 +2375,16 @@ def export():
             return jsonify({"error": perr}), 400
 
         if fmt == "shp":
-            blob, err = shapefile_zip(db, out_sql, cols, stem)
+            want_crs = request.args.get("crs")
+            epsg = crs_allowed(want_crs) if want_crs else None
+            if want_crs and epsg is None:
+                return jsonify({"error": "EPSG:{} is not one of the offered "
+                                         "coordinate systems.".format(want_crs)}), 400
+            blob, err = shapefile_zip(db, out_sql, cols, stem, epsg)
             if err:
                 return jsonify({"error": err}), 400
+            if epsg and epsg != 4326:
+                stem = "{}_epsg{}".format(stem, epsg)
             return Response(
                 blob,
                 content_type="application/zip",
@@ -1983,13 +2404,117 @@ def export():
             headers={"Content-Disposition": 'attachment; filename="{}"'.format(fname),
                      "Cache-Control": "no-store"})
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": oops(e, "That download could not be built.")}), 500
+
+
+@app.route('/api/geojson')
+def geojson_for_map():
+    """The rows behind an answer, as features the page can draw.
+
+    Deliberately not the export: geometry is simplified and rounded, and the
+    feature count is capped, because this is for a screen rather than for QGIS.
+    """
+    if not rate_ok("map", EXPORT_LIMIT * 3):
+        return too_many("map requests")
+
+    db = request.args.get('db', '')
+    sql = (request.args.get('sql') or '').strip()
+    table_name = (request.args.get('table') or '').strip()
+
+    if not db or not db_allowed(db):
+        return jsonify({"error": "That database is not available here."}), 403
+    if not sql and not table_name:
+        return jsonify({"error": "Nothing to draw"}), 400
+    if len(sql) > MAX_EXPORT_SQL_CHARS:
+        return jsonify({"error": "That query is too long."}), 400
+    if sql and not (ALLOW_RAW_SQL or signature_ok(sql, request.args.get('sig', ''))):
+        return jsonify({"error": "That query did not come from this page."}), 403
+
+    try:
+        tables = get_schema_info(db)
+        if table_name:
+            table = find_table(tables, table_name)
+            if not table:
+                return jsonify({"error": "No table called " + table_name}), 404
+            built, err = table_export_sql(table, "geojson", for_map=True)
+        else:
+            if not sql.upper().startswith(READ_ONLY_PREFIXES):
+                return jsonify({"error": "Only SELECT / WITH queries can be drawn."}), 400
+            built, err = answer_export_sql(sql, tables, "geojson", for_map=True)
+        if err:
+            return jsonify({"error": err}), 400
+
+        capped = "SELECT * FROM ({}) _map LIMIT {}".format(built, MAP_MAX_FEATURES + 1)
+        res, qerr = execute_sql(db, capped)
+        if qerr:
+            return jsonify({"error": db_error_text(qerr)}), 400
+
+        rows = res["rows"]
+        truncated = len(rows) > MAP_MAX_FEATURES
+        features = []
+        for row in rows[:MAP_MAX_FEATURES]:
+            raw = row.get(GEOJSON_COL)
+            if not raw:
+                continue
+            try:
+                geometry = json.loads(raw)
+            except (TypeError, ValueError):
+                continue
+            props = {k: export_value(v) for k, v in row.items() if k != GEOJSON_COL}
+            features.append({"type": "Feature", "geometry": geometry, "properties": props})
+
+        return jsonify({"type": "FeatureCollection", "features": features,
+                        "truncated": truncated, "limit": MAP_MAX_FEATURES})
+    except Exception as e:
+        return jsonify({"error": oops(e, "That map could not be drawn.")}), 500
+
+
+@app.route('/api/refresh', methods=['POST'])
+def refresh_schema():
+    """Re-read a schema after the data changes, without a redeploy."""
+    if not REFRESH_TOKEN:
+        return jsonify({"error": "Refresh is not enabled here."}), 404
+    token = request.headers.get("X-Refresh-Token", "")
+    if not hmac.compare_digest(token, REFRESH_TOKEN):
+        return jsonify({"error": "No."}), 403
+    db = request.args.get('db', '')
+    try:
+        names = [db] if db else get_databases()
+        for name in names:
+            if db_allowed(name):
+                get_schema_info(name, refresh=True)
+        return jsonify({"refreshed": names})
+    except Exception as e:
+        return jsonify({"error": oops(e)}), 500
+
+
+@app.route('/api/crs')
+def list_crs():
+    """The coordinate systems a shapefile can be delivered in, straight from
+    the bundled skill's verified table."""
+    try:
+        return jsonify({"crs": crs_choices()})
+    except Exception as e:
+        return oops(e)
 
 
 @app.route('/healthz')
 def healthz():
     """So a host can tell the app is alive without touching the database."""
-    return jsonify({"ok": True})
+    return jsonify({"ok": True, "warm": sorted(_schema_cache.keys())})
+
+
+def start_up():
+    """Load yesterday's cache, then fill in whatever is missing, in the
+    background. The page and /healthz answer immediately either way."""
+    _load_schema_from_disk()
+    if os.environ.get("WARM_SCHEMA", "1").lower() in ("0", "false", "no"):
+        return
+    threading.Thread(target=warm_schema_cache, name="schema-warm-up",
+                     daemon=True).start()
+
+
+start_up()
 
 
 if __name__ == '__main__':

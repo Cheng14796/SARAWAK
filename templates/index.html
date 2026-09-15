@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sarawak Database Chat - ask your data in plain English</title>
+<meta name="description" content="Ask Sarawak subbasin and rainfall station data questions in plain English. See the answer, map it, and download it as CSV, JSON, GeoJSON or a shapefile.">
+<meta name="color-scheme" content="dark light">
+<link rel="icon" href="/favicon.ico" type="image/svg+xml">
+<link rel="stylesheet" href="{{ url_for('static', filename='vendor/leaflet.css') }}?v={{ v }}">
+<link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}?v={{ v }}">
+</head>
+<body data-raw-sql="{{ raw_sql }}">
+
+<!-- One sprite, so the page needs no icon font from a CDN. -->
+<svg class="sprite" width="0" height="0" aria-hidden="true" focusable="false"><defs>
+  <symbol id="ic-db" viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4 3 9 3s9-1.34 9-3"/></symbol>
+  <symbol id="ic-download" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></symbol>
+  <symbol id="ic-chat" viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></symbol>
+  <symbol id="ic-bot" viewBox="0 0 24 24"><rect x="4" y="7" width="16" height="13" rx="2"/><circle cx="9" cy="13" r="1.2"/><circle cx="15" cy="13" r="1.2"/><line x1="12" y1="3" x2="12" y2="7"/><line x1="2" y1="13" x2="4" y2="13"/><line x1="20" y1="13" x2="22" y2="13"/></symbol>
+  <symbol id="ic-user" viewBox="0 0 24 24"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></symbol>
+  <symbol id="ic-send" viewBox="0 0 24 24"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></symbol>
+  <symbol id="ic-table" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="3" y1="9" x2="21" y2="9"/><line x1="3" y1="15" x2="21" y2="15"/><line x1="9" y1="3" x2="9" y2="21"/></symbol>
+  <symbol id="ic-filter" viewBox="0 0 24 24"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></symbol>
+  <symbol id="ic-chart" viewBox="0 0 24 24"><line x1="12" y1="20" x2="12" y2="10"/><line x1="18" y1="20" x2="18" y2="4"/><line x1="6" y1="20" x2="6" y2="16"/></symbol>
+  <symbol id="ic-award" viewBox="0 0 24 24"><circle cx="12" cy="8" r="6"/><polyline points="8.21 13.89 7 23 12 20 17 23 15.79 13.88"/></symbol>
+  <symbol id="ic-list" viewBox="0 0 24 24"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></symbol>
+  <symbol id="ic-hash" viewBox="0 0 24 24"><line x1="4" y1="9" x2="20" y2="9"/><line x1="4" y1="15" x2="20" y2="15"/><line x1="10" y1="3" x2="8" y2="21"/><line x1="16" y1="3" x2="14" y2="21"/></symbol>
+  <symbol id="ic-file" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="8" y1="13" x2="16" y2="13"/><line x1="8" y1="17" x2="13" y2="17"/></symbol>
+  <symbol id="ic-code" viewBox="0 0 24 24"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></symbol>
+  <symbol id="ic-map" viewBox="0 0 24 24"><polygon points="1 6 1 22 8 18 16 22 23 18 23 2 16 6 8 2 1 6"/><line x1="8" y1="2" x2="8" y2="18"/><line x1="16" y1="6" x2="16" y2="22"/></symbol>
+  <symbol id="ic-layers" viewBox="0 0 24 24"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></symbol>
+  <symbol id="ic-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></symbol>
+  <symbol id="ic-check" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></symbol>
+  <symbol id="ic-alert" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></symbol>
+  <symbol id="ic-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></symbol>
+  <symbol id="ic-moon" viewBox="0 0 24 24"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></symbol>
+  <symbol id="ic-trash" viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></symbol>
+  <symbol id="ic-up" viewBox="0 0 24 24"><line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/></symbol>
+  <symbol id="ic-spin" viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-6.22-8.56"/></symbol>
+</defs></svg>
+
+<a class="skip" href="#inp">Skip to the question box</a>
+
+<header class="hd">
+  <div class="hd-l">
+    <h1><span class="ic"><svg class="i" aria-hidden="true"><use href="#ic-db"/></svg></span> Database Chat</h1>
+  </div>
+  <div class="hd-r">
+    <label class="skip" for="dbSel">Database</label>
+    <select class="dsel" id="dbSel"><option value="">Loading...</option></select>
+    <button class="btn-exp" id="expBtn" disabled title="Download whole tables from this database">
+      <svg class="i" aria-hidden="true"><use href="#ic-download"/></svg> Export
+    </button>
+    <button class="btn-i" id="clearBtn" title="Clear this conversation" aria-label="Clear this conversation">
+      <svg class="i" aria-hidden="true"><use href="#ic-trash"/></svg>
+    </button>
+    <button class="btn-i" id="themeBtn" title="Switch between light and dark" aria-label="Switch between light and dark">
+      <svg class="i" aria-hidden="true"><use href="#ic-moon"/></svg>
+    </button>
+    <span class="pl off" id="connSt"><span class="dt"></span>No database</span>
+  </div>
+</header>
+
+<main class="ms" id="msgBox" aria-live="polite" aria-label="Conversation">
+  <div class="wc" id="welcome">
+    <p class="lead"><svg class="i" aria-hidden="true"><use href="#ic-up"/></svg> First, pick a database above</p>
+    <div class="wi"><svg class="i" aria-hidden="true"><use href="#ic-chat"/></svg></div>
+    <h2>Ask about your data in plain English</h2>
+    <p>Type normally - no SQL, and spelling does not have to be perfect.<br>
+    Examples: "how many stations at kucing", "stations per division", "list all districts"</p>
+  </div>
+</main>
+
+<div class="ip">
+  <div class="ip-r">
+    <label class="skip" for="inp">Your question</label>
+    <textarea id="inp" placeholder="Select a database first..." rows="1"></textarea>
+    <button class="btn-send" id="sendBtn" disabled aria-label="Send question">
+      <svg class="i" aria-hidden="true"><use href="#ic-send"/></svg>
+    </button>
+  </div>
+  <div class="ip-h">Enter to send, Shift+Enter for a new line</div>
+</div>
+
+<script src="{{ url_for('static', filename='vendor/leaflet.js') }}?v={{ v }}"></script>
+<script src="{{ url_for('static', filename='app.js') }}?v={{ v }}"></script>
+</body>
+</html>

@@ -5,3 +5,5 @@ __pycache__/
 .claude/
 .agents/
 skills-lock.json
+
+test_neon_export.py
