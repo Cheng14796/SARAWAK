@@ -3,8 +3,8 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Sarawak Database Chat - ask your data in plain English</title>
-<meta name="description" content="Ask Sarawak subbasin and rainfall station data questions in plain English. See the answer, map it, and download it as CSV, JSON, GeoJSON or a shapefile.">
+<title>{{ app_title }} - ask your data in plain English</title>
+<meta name="description" content="Ask your PostgreSQL and PostGIS data questions in plain English. See the answer, map it, and download it as CSV, JSON, GeoJSON or a shapefile.">
 <meta name="color-scheme" content="dark light">
 <link rel="icon" href="/favicon.ico" type="image/svg+xml">
 <link rel="stylesheet" href="{{ url_for('static', filename='vendor/leaflet.css') }}?v={{ v }}">
@@ -44,7 +44,7 @@
 
 <header class="hd">
   <div class="hd-l">
-    <h1><span class="ic"><svg class="i" aria-hidden="true"><use href="#ic-db"/></svg></span> Database Chat</h1>
+    <h1><span class="ic"><svg class="i" aria-hidden="true"><use href="#ic-db"/></svg></span> {{ app_title }}</h1>
   </div>
   <div class="hd-r">
     <label class="skip" for="dbSel">Database</label>

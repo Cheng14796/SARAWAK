@@ -16,8 +16,12 @@ services:
         value: "3.12.6"
       - key: DATABASE_URL
         sync: false          # paste the managed Postgres URL in the dashboard
+      # Optional. Left out, every database with tables is offered; naming them
+      # here keeps the host's own neondb/postgres out of the dropdown.
       - key: VISIBLE_DATABASES
         value: "sarawak basin,subbasin_gis"
+      - key: APP_TITLE
+        value: "Sarawak Database Chat"
       - key: ALLOW_RAW_SQL
         value: "0"           # public site: plain English only, no typed SQL
       - key: SECRET_KEY

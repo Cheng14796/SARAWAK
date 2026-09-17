@@ -193,8 +193,15 @@
   // of the bundled GIS skill's verified EPSG table.
   var crsOptions = [];
 
-  function loadCrs() {
-    fetch('/api/crs').then(function (r) { return r.json(); }).then(function (d) {
+  // Asked for per database, because what to suggest depends on where the data
+  // is: a national grid for the country it falls in, otherwise its UTM zone.
+  function loadCrs(db, tables) {
+    var q = '';
+    if (db) {
+      var geo = (tables || []).filter(function (t) { return t.geometry; })[0];
+      q = '?db=' + encodeURIComponent(db) + (geo ? '&table=' + encodeURIComponent(geo.table) : '');
+    }
+    fetch('/api/crs' + q).then(function (r) { return r.json(); }).then(function (d) {
       crsOptions = d.crs || [];
     }).catch(function () { crsOptions = []; });
   }
@@ -405,6 +412,7 @@
         hideTyping();
         curTables = d.tables || [];
         expBtn.disabled = !curTables.length;
+        loadCrs(db, curTables);
         if (turns.length) {
           replay();
         } else {
@@ -689,6 +697,5 @@
   }
 
   loadDbs();
-  loadCrs();
   inp.focus();
 })();

@@ -82,18 +82,57 @@ def copy_database(source_url: str, target_url: str, db_name: str):
         print(f"  ❌ Error: {e}")
         return False
 
+def discover_databases(source_url):
+    """Every database on the source worth copying.
+
+    Asked of the server rather than written down, so this script works for
+    whoever runs it - not only for the databases it was first written against.
+    """
+    import psycopg2
+    from urllib.parse import urlparse, unquote
+
+    p = urlparse(source_url)
+    conn = psycopg2.connect(
+        host=p.hostname or "localhost", port=p.port or 5432,
+        user=unquote(p.username or "postgres"), password=unquote(p.password or ""),
+        database=(p.path or "/postgres").lstrip("/") or "postgres")
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT datname FROM pg_database "
+                    "WHERE datistemplate = false AND datallowconn ORDER BY 1")
+        names = [r[0] for r in cur.fetchall()]
+        cur.close()
+    finally:
+        conn.close()
+
+    skip = {"template0", "template1", "rdsadmin", "azure_maintenance",
+            "azure_sys", "cloudsqladmin", "alloydbadmin"}
+    return [n for n in names if n.lower() not in skip]
+
+
 def main():
     if len(sys.argv) < 3:
-        print("Usage: python migrate_to_host.py <source_url> <target_url>")
-        print("Example: python migrate_to_host.py 'postgresql://user:pass@localhost/db' 'postgresql://user:pass@neon.tech/db'")
+        print("Usage: python migrate_to_host.py <source_url> <target_url> [db ...]")
+        print("Example: python migrate_to_host.py 'postgresql://user:pass@localhost/postgres' 'postgresql://user:pass@neon.tech/neondb'")
+        print("\nWithout a list of databases, every database on the source is copied.")
         sys.exit(1)
-    
+
     source_url = sys.argv[1]
     target_url = sys.argv[2]
-    
-    # Database names to migrate
-    databases = ['subbasin_gis', 'sarawak basin']
-    
+
+    # Name them on the command line, or let the source tell us what it has.
+    databases = sys.argv[3:]
+    if not databases:
+        try:
+            databases = discover_databases(source_url)
+        except Exception as e:
+            print(f"❌ Could not list databases on the source: {e}")
+            sys.exit(1)
+        if not databases:
+            print("❌ No databases to copy.")
+            sys.exit(1)
+        print(f"Found {len(databases)} database(s): {', '.join(databases)}")
+
     print("🚀 Starting migration to Neon")
     print(f"Source: {source_url[:30]}...")
     print(f"Target: {target_url[:30]}...")

@@ -40,7 +40,10 @@ log = logging.getLogger("database-chat")
 
 # Static files are stamped with this in the page, so a browser can cache them
 # hard and still pick up a new version the moment one ships.
-ASSET_VERSION = "4"
+ASSET_VERSION = "5"
+
+# What the page calls itself. Set APP_TITLE to name your own deployment.
+APP_TITLE = os.environ.get("APP_TITLE", "Database Chat").strip() or "Database Chat"
 app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 60 * 60 * 24
 
 # How much of the data we index up front so questions can be matched
@@ -142,10 +145,25 @@ DB_CONFIG["options"] = "-c statement_timeout={}".format(STATEMENT_TIMEOUT_MS)
 DB_CONFIG["connect_timeout"] = int(os.environ.get("CONNECT_TIMEOUT", "10"))
 DB_CONFIG["application_name"] = "database-chat"
 
-# Only these databases are offered in the dropdown, in this order.
-# Set to an empty list to show every database on the server again.
+# An optional allow-list: set VISIBLE_DATABASES to show only these, in this
+# order. Left unset - the default - every database on the server is offered,
+# so pointing this app at someone else's PostgreSQL just works.
 VISIBLE_DATABASES = [d.strip() for d in os.environ.get(
-    "VISIBLE_DATABASES", "sarawak basin,subbasin_gis").split(",") if d.strip()]
+    "VISIBLE_DATABASES", "").split(",") if d.strip()]
+
+# Housekeeping databases that belong to PostgreSQL or to the hosting provider.
+# Nobody wants to ask questions of these, and on a managed host some of them
+# refuse connections outright.
+INTERNAL_DATABASES = {
+    "template0", "template1",                     # PostgreSQL's own
+    "rdsadmin", "azure_maintenance", "azure_sys",  # AWS RDS, Azure
+    "cloudsqladmin", "alloydbadmin", "alloydbmetadata",  # Google
+    "defaultdb_replica", "_timescaledb_internal",
+}
+
+# "postgres", "neondb" and the like exist on every server as a default landing
+# database and are usually empty - but some people do keep real tables in one,
+# so emptiness is checked rather than assumed from the name.
 
 # ============ SCHEMA CACHE ============
 # Reading a schema is not cheap: a COUNT(*) per table, then a DISTINCT scan of
@@ -317,23 +335,70 @@ def get_connection(dbname):
     return _pool_for(dbname).borrow()
 
 
+_has_tables_cache = {}
+
+
+def has_user_tables(dbname):
+    """Whether a database holds anything worth asking about.
+
+    Cached: this runs once per database to build the dropdown, and an empty
+    database does not fill itself while the server is up. /api/refresh clears
+    it for the case where it does.
+    """
+    if dbname in _has_tables_cache:
+        return _has_tables_cache[dbname]
+    found = False
+    try:
+        conn = get_connection(dbname)
+        try:
+            cur = conn.cursor()
+            cur.execute("""SELECT 1 FROM information_schema.tables
+                           WHERE table_schema NOT IN ('pg_catalog', 'information_schema')
+                             AND table_type = 'BASE TABLE'
+                             AND table_name NOT IN %s
+                           LIMIT 1""", (tuple(SYSTEM_TABLES),))
+            found = cur.fetchone() is not None
+            cur.close()
+        finally:
+            conn.close()
+    except Exception as e:
+        # Unreachable is not the same as empty - a database we cannot open is
+        # better left in the list than silently dropped.
+        log.info("could not inspect database %r: %s", dbname, e)
+        found = True
+    _has_tables_cache[dbname] = found
+    return found
+
+
 def get_databases():
+    """Every database worth offering, or exactly the configured list."""
     conn = get_connection(ADMIN_DB)
     try:
         cur = conn.cursor()
-        cur.execute("SELECT datname FROM pg_database WHERE datistemplate = false ORDER BY datname")
+        cur.execute("SELECT datname FROM pg_database "
+                    "WHERE datistemplate = false AND datallowconn "
+                    "ORDER BY datname")
         dbs = [r[0] for r in cur.fetchall()]
         cur.close()
     finally:
         conn.close()
+
     if VISIBLE_DATABASES:
         # Keep the configured order, and skip any that aren't on this server
         return [d for d in VISIBLE_DATABASES if d in dbs]
-    return dbs
+
+    # A database with no tables has nothing to answer, so it is left out
+    # rather than offered as a dead end.
+    offered = [d for d in dbs
+               if d.lower() not in INTERNAL_DATABASES and has_user_tables(d)]
+    # Everything was filtered out - better a usable dropdown than an empty one.
+    return offered or [d for d in dbs if d.lower() not in INTERNAL_DATABASES]
 
 
 def db_allowed(dbname):
-    return (not VISIBLE_DATABASES) or dbname in VISIBLE_DATABASES
+    if VISIBLE_DATABASES:
+        return dbname in VISIBLE_DATABASES
+    return dbname.lower() not in INTERNAL_DATABASES
 
 
 def get_schema_info(dbname, refresh=False):
@@ -590,10 +655,53 @@ CRS_REFERENCE = os.path.join(SKILL_DIR, "references", "malaysian_crs.md")
 
 WGS84 = {"epsg": 4326, "label": "WGS84 lon/lat (EPSG:4326)", "note": "as stored"}
 
-# Sarawak is East Malaysia, so the modern grid is BRSO (3376), not Peninsular
-# RSO (3375) - the two differ only in their projection origin and are easy to
-# confuse. See the skill's quick-reference table.
-PREFERRED_EPSG = 3376
+# Which projected grid to recommend depends on where the data actually is, so
+# it is worked out from the layer's own extent rather than fixed in advance.
+# Malaysian data gets the verified national grid from the skill's table;
+# anything else gets its UTM zone, which is defined worldwide.
+#
+# Malaysia splits across two national grids that are easy to mix up: the
+# Peninsula in the west and Borneo (Sabah/Sarawak) in the east. They share
+# nearly all their projection parameters, so the wrong one produces a
+# plausible-looking answer - about 1.9% out on area for Sarawak data.
+MY_PENINSULA_EPSG = 3375
+MY_BORNEO_EPSG = 3376
+
+# Rough boxes, only ever used to pick which grid to *suggest*.
+MY_BOUNDS = (99.0, 0.5, 120.0, 7.6)          # all of Malaysia
+MY_PENINSULA_MAX_LON = 105.0                  # west of this is the Peninsula
+MY_BORNEO_MIN_LON = 108.0                     # east of this is Borneo
+
+
+def utm_epsg(lon, lat):
+    """The UTM zone covering a point. Defined for the whole world, metre units,
+    and about as good as a general-purpose projected CRS gets without knowing
+    the local national grid."""
+    zone = int((lon + 180.0) // 6.0) + 1
+    zone = max(1, min(60, zone))
+    return (32600 if lat >= 0 else 32700) + zone
+
+
+def within(bounds, lon, lat):
+    return bounds[0] <= lon <= bounds[2] and bounds[1] <= lat <= bounds[3]
+
+
+def recommend_epsg(extent):
+    """(epsg, why) for a layer, from its centre. None when there is no extent."""
+    if not extent:
+        return None, ""
+    lon = (extent[0] + extent[2]) / 2.0
+    lat = (extent[1] + extent[3]) / 2.0
+
+    if within(MY_BOUNDS, lon, lat):
+        if lon >= MY_BORNEO_MIN_LON:
+            return MY_BORNEO_EPSG, "recommended - Sabah/Sarawak national grid"
+        if lon <= MY_PENINSULA_MAX_LON:
+            return MY_PENINSULA_EPSG, "recommended - Peninsular Malaysia grid"
+
+    zone = utm_epsg(lon, lat)
+    return zone, "recommended - UTM zone {}{} for this data".format(
+        zone % 100, "N" if lat >= 0 else "S")
 
 RE_CRS_ROW = re.compile(r'^\|\s*(?!-)(?P<name>[^|]+?)\s*\|\s*\*{0,2}(?P<epsg>\d{4,5})\*{0,2}\s*\|')
 
@@ -634,37 +742,90 @@ def _parse_crs_reference(path=CRS_REFERENCE):
     return out
 
 
-def crs_choices():
-    """WGS84 first, then the recommended Sarawak grid, then the rest."""
-    choices = _crs_cache.get("all")
-    if choices is None:
-        parsed = _parse_crs_reference()
-        preferred = [c for c in parsed if c["epsg"] == PREFERRED_EPSG]
-        rest = [c for c in parsed if c["epsg"] != PREFERRED_EPSG]
-        for c in preferred:
-            c = dict(c)
-            c["note"] = "recommended for Sarawak"
-        choices = [WGS84] + [dict(c, note="recommended for Sarawak")
-                             for c in preferred] + rest
-        _crs_cache["all"] = choices
-        log.info("CRS choices: %d, read from %s",
-                 len(choices), os.path.basename(CRS_REFERENCE))
+def malaysian_grids():
+    grids = _crs_cache.get("my")
+    if grids is None:
+        grids = _parse_crs_reference()
+        _crs_cache["my"] = grids
+        log.info("CRS reference: %d Malaysian grids from %s",
+                 len(grids), os.path.basename(CRS_REFERENCE))
+    return grids
+
+
+def layer_extent(dbname, table):
+    """A layer's bounding box in lon/lat, or None. Cached - it only changes
+    when the data does, and it is only ever used to suggest a CRS."""
+    key = (dbname, table["schema"], table["table"])
+    if key in _extent_cache:
+        return _extent_cache[key]
+
+    extent = None
+    geom = geom_column(table["columns"])
+    if geom:
+        box = GEOM_4326.format(g=quote_ident(geom))
+        res, err = execute_sql(dbname,
+                               "SELECT ST_XMin(e) a, ST_YMin(e) b, "
+                               "ST_XMax(e) c, ST_YMax(e) d FROM "
+                               "(SELECT ST_Extent({}) e FROM {}.{}) q".format(
+                                   box, quote_ident(table["schema"]),
+                                   quote_ident(table["table"])))
+        if not err and res["rows"] and res["rows"][0]["a"] is not None:
+            r = res["rows"][0]
+            extent = (float(r["a"]), float(r["b"]), float(r["c"]), float(r["d"]))
+    _extent_cache[key] = extent
+    return extent
+
+
+def crs_choices(dbname=None, table=None):
+    """The coordinate systems a shapefile can be delivered in.
+
+    WGS84 always, then whatever suits this particular layer - its national grid
+    if the data sits in Malaysia, otherwise its UTM zone. The Malaysian grids
+    are only listed when the data is actually there; for a user in Peru they
+    would be twenty lines of noise.
+    """
+    extent = layer_extent(dbname, table) if (dbname and table) else None
+    epsg, why = recommend_epsg(extent)
+
+    choices = [dict(WGS84)]
+    grids = malaysian_grids()
+    by_epsg = {c["epsg"]: c for c in grids}
+    in_malaysia = bool(extent) and within(
+        MY_BOUNDS, (extent[0] + extent[2]) / 2.0, (extent[1] + extent[3]) / 2.0)
+
+    if epsg is not None:
+        known = by_epsg.get(epsg)
+        label = known["label"] if known else "UTM zone {}{} (EPSG:{})".format(
+            epsg % 100, "N" if epsg < 32700 else "S", epsg)
+        choices.append({"epsg": epsg, "label": label, "note": why})
+
+    if in_malaysia:
+        choices += [c for c in grids if c["epsg"] != epsg]
+    elif extent is None:
+        # Nothing to go on - offer the verified table rather than nothing.
+        choices += grids
     return choices
 
 
 _crs_cache = {}
+_extent_cache = {}
 
 
-def crs_allowed(epsg):
-    """Only codes from the verified table - never an arbitrary SRID."""
+def crs_allowed(epsg, dbname=None, table=None):
+    """Only a code this server offered - never an arbitrary SRID."""
     try:
         epsg = int(epsg)
     except (TypeError, ValueError):
         return None
-    for c in crs_choices():
+    for c in crs_choices(dbname, table):
         if c["epsg"] == epsg:
             return epsg
+    # A UTM zone is always a safe, well-defined target even if this particular
+    # layer suggested a different one.
+    if 32601 <= epsg <= 32660 or 32701 <= epsg <= 32760:
+        return epsg
     return None
+
 
 # smart_ask caps its display query at 100 rows; an explicit "top 5" sets its own
 # limit instead. Only the display cap is dropped on export - "top 5" must stay 5.
@@ -1484,8 +1645,13 @@ def geom_info(dbname, table):
     return geometry_registry(dbname).get((table["schema"], table["table"]))
 
 
-def split_geom_tables(dbname, tables):
-    """The point layer and the polygon layer, if there is exactly one of each."""
+def split_geom_tables(dbname, tables, accepted=None):
+    """The point layer and the polygon layer this question is about.
+
+    One of each and the choice is obvious. With several - a database holding
+    wells, towns, parcels and districts - the question decides: whichever layer
+    it names wins, and if it names none, there is nothing to guess at.
+    """
     pts, polys = [], []
     for t in tables:
         info = geom_info(dbname, t)
@@ -1495,9 +1661,19 @@ def split_geom_tables(dbname, tables):
             pts.append((t, info))
         elif "POLYGON" in info["type"]:
             polys.append((t, info))
-    if len(pts) == 1 and len(polys) == 1:
-        return pts[0], polys[0]
-    return (None, None), (None, None)
+
+    def pick(candidates):
+        if len(candidates) == 1:
+            return candidates[0]
+        if not candidates or accepted is None:
+            return (None, None)
+        named = [c for c in candidates if mentions_table(accepted, c[0])]
+        return named[0] if len(named) == 1 else (None, None)
+
+    point, poly = pick(pts), pick(polys)
+    if point[0] is None or poly[0] is None:
+        return (None, None), (None, None)
+    return point, poly
 
 
 def qualified(t):
@@ -1606,7 +1782,7 @@ def spatial_answer(q, q_orig, dbname, tables, accepted, ctx_key):
     Only runs where the database really has one point layer and one polygon
     layer - anything else and a spatial reading would be guesswork.
     """
-    (pt_t, pt_i), (poly_t, poly_i) = split_geom_tables(dbname, tables)
+    (pt_t, pt_i), (poly_t, poly_i) = split_geom_tables(dbname, tables, accepted)
     if pt_t is None:
         return None
 
@@ -2205,6 +2381,7 @@ def security_headers(resp):
 @app.route('/')
 def index():
     return render_template("index.html", v=ASSET_VERSION,
+                           app_title=APP_TITLE,
                            raw_sql=1 if ALLOW_RAW_SQL else 0)
 
 
@@ -2376,7 +2553,8 @@ def export():
 
         if fmt == "shp":
             want_crs = request.args.get("crs")
-            epsg = crs_allowed(want_crs) if want_crs else None
+            epsg = crs_allowed(want_crs, db, table if table_name else None) \
+                if want_crs else None
             if want_crs and epsg is None:
                 return jsonify({"error": "EPSG:{} is not one of the offered "
                                          "coordinate systems.".format(want_crs)}), 400
@@ -2490,10 +2668,18 @@ def refresh_schema():
 
 @app.route('/api/crs')
 def list_crs():
-    """The coordinate systems a shapefile can be delivered in, straight from
-    the bundled skill's verified table."""
+    """The coordinate systems a shapefile can be delivered in.
+
+    Pass ?db= and ?table= to get the list that suits that layer - its national
+    grid or its UTM zone. Without them, only the general choices.
+    """
+    db = request.args.get("db", "")
+    table_name = (request.args.get("table") or "").strip()
     try:
-        return jsonify({"crs": crs_choices()})
+        table = None
+        if db and db_allowed(db) and table_name:
+            table = find_table(get_schema_info(db), table_name)
+        return jsonify({"crs": crs_choices(db if table else None, table)})
     except Exception as e:
         return oops(e)
 

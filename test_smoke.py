@@ -208,70 +208,86 @@ def test_with_database():
     check("a table exports as CSV",
           r.status_code == 200 and r.get_data(as_text=True).count(chr(10)) > 1)
 
-    # Spatial questions need both a point layer and a polygon layer, which is
-    # not necessarily the first database on the server.
+    # Spatial questions need an unambiguous point layer and polygon layer,
+    # which is not necessarily the first database on the server.
     for candidate in chatbox.get_databases():
-        its_tables = (client.get("/api/schema?db=" + candidate).get_json()
-                      or {}).get("tables", [])
-        if len([t for t in its_tables if t.get("geometry")]) >= 2:
-            check_spatial_questions(client, candidate, its_tables)
+        its_tables = chatbox.get_schema_info(candidate)
+        (pt, _pi), (poly, _qi) = chatbox.split_geom_tables(candidate, its_tables)
+        if pt is not None:
+            check_spatial_questions(client, candidate, pt, poly)
             return
-    skip("spatial questions", "no database has both a point and a polygon layer")
+    skip("spatial questions", "no database has a point layer and a polygon layer")
 
 
-def check_spatial_questions(client, db, tables):
+def check_spatial_questions(client, db, pt, poly):
     """A question about where things are must reach the geometry.
 
-    The attribute matcher answers several of these by accident - "which
-    subbasin is station X in" becomes a text filter on a similarly-named
-    column - so the check is not that an answer came back, but that the SQL
-    behind it actually used PostGIS.
-    """
-    geo = [t for t in tables if t.get("geometry")]
-    if len(geo) < 2:
-        skip("spatial questions", "needs a point layer and a polygon layer")
-        return
+    The attribute matcher answers several of these by accident - "which area is
+    point X in" becomes a text filter on a similarly-named column - so the check
+    is not that an answer came back, but that the SQL behind it used PostGIS.
 
+    The questions are built from this database's own table and column names, so
+    the test travels to whatever data someone else points the app at.
+    """
     def sql_for(question):
         r = client.post("/api/ask", json={"database": db, "question": question})
         return (r.get_json() or {}).get("sql") or ""
 
     spatial = ("ST_Contains", "ST_DWithin", "<->")
-    for question in ["how many stations in each subbasin",
-                     "stations within 10 km of Kapit",
-                     "nearest station to Kapit"]:
+    points, areas = pt["table"], poly["table"]
+
+    # A value from the polygon layer to measure from, e.g. a district name.
+    place = None
+    for column, values in (poly.get("values") or {}).items():
+        if 1 < len(values) <= 25:
+            place, place_col = values[0], column
+            break
+
+    questions = ["how many {} in each {}".format(points, areas)]
+    if place:
+        questions += ["{} within 10 km of {}".format(points, place),
+                      "nearest {} to {}".format(points, place)]
+
+    for question in questions:
         s = sql_for(question)
-        check("answers spatially: " + question[:34],
+        check("answers spatially: " + question[:40],
               any(k in s for k in spatial), "sql was: " + " ".join(s.split())[:90])
 
     # Distances in a geographic CRS are degrees, so metres have to go through
     # ::geography. Without the cast "within 10 km" silently matches everything.
-    s = sql_for("stations within 10 km of Kapit")
-    check("distance is measured in metres, not degrees", "::geography" in s)
+    if place:
+        s = sql_for("{} within 10 km of {}".format(points, place))
+        check("distance is measured in metres, not degrees", "::geography" in s)
+    else:
+        skip("distance check", "no short value list to measure from")
 
     # ...and the reverse: an ordinary grouping must not become a spatial join.
-    for question in ["stations per division", "list all division",
-                     "how many stations at kuching"]:
+    plain = None
+    for column, values in (pt.get("values") or {}).items():
+        if 1 < len(values) <= 25:
+            plain = column
+            break
+    if not plain:
+        skip("attribute questions stay attribute questions", "nothing to group by")
+        return
+    for question in ["{} per {}".format(points, plain),
+                     "list all {}".format(plain),
+                     "how many {} at {}".format(points, pt["values"][plain][0])]:
         s = sql_for(question)
-        check("stays an attribute question: " + question[:28],
-              not any(k in s for k in spatial))
+        check("stays an attribute question: " + question[:34],
+              not any(k in s for k in spatial),
+              "sql was: " + " ".join(sql_for(question).split())[:80])
 
 
 def test_crs_reference():
     """The download CRS list is read from the bundled skill, not from memory."""
-    choices = chatbox.crs_choices()
-    by_epsg = {c["epsg"]: c for c in choices}
+    grids = chatbox.malaysian_grids()
+    by_epsg = {c["epsg"]: c for c in grids}
 
-    check("CRS list is read from the skill file", len(choices) > 5,
-          "got %d" % len(choices))
-    check("WGS84 is the default first choice", choices[0]["epsg"] == 4326)
-
-    # Sarawak is East Malaysia: BRSO, not the Peninsular grid. Getting this
-    # wrong is a ~1.9% area error, not a rounding difference.
-    check("Sarawak's grid is offered and recommended",
-          3376 in by_epsg and "recommend" in by_epsg[3376]["note"])
-    check("the Peninsular grid is offered but not recommended",
-          3375 in by_epsg and "recommend" not in by_epsg[3375]["note"])
+    check("CRS reference is read from the skill file", len(grids) > 5,
+          "got %d" % len(grids))
+    check("WGS84 is the default first choice",
+          chatbox.crs_choices()[0]["epsg"] == 4326)
 
     # Legacy datums share their projection parameters with the modern grids but
     # use a different ellipsoid, so they have to be labelled.
@@ -281,7 +297,55 @@ def test_crs_reference():
 
     check("an unlisted SRID is refused", chatbox.crs_allowed(9999) is None)
     check("a junk SRID is refused", chatbox.crs_allowed("; DROP") is None)
-    check("a listed SRID is accepted", chatbox.crs_allowed(3376) == 3376)
+    check("any UTM zone is accepted", chatbox.crs_allowed(32630) == 32630)
+
+
+def test_crs_recommendation():
+    """Which grid to suggest comes from where the data is, not from a constant.
+
+    Malaysia is the interesting case: it straddles two national grids whose
+    parameters are nearly identical, so picking by longitude matters - for the
+    Sarawak data, the wrong one is 1.9% out on area.
+    """
+    for name, extent, want in [
+            ("Sarawak", (111.16, 1.22, 115.23, 3.35), 3376),
+            ("Peninsular Malaysia", (100.1, 2.0, 104.5, 6.5), 3375),
+            ("London", (-0.51, 51.28, 0.33, 51.69), 32630),
+            ("Lima", (-77.2, -12.3, -76.8, -11.9), 32718),
+            ("Sydney", (150.9, -34.1, 151.3, -33.7), 32756),
+    ]:
+        got, why = chatbox.recommend_epsg(extent)
+        check("recommends EPSG:%d for %s" % (want, name), got == want,
+              "got %s (%s)" % (got, why))
+
+    check("no extent means no recommendation",
+          chatbox.recommend_epsg(None) == (None, ""))
+
+    # Twenty Malaysian grids are noise to someone mapping London.
+    fake = {"schema": "public", "table": "_crs_test",
+            "columns": [{"name": "geom", "type": "USER-DEFINED"}]}
+    chatbox._extent_cache[("_t", "public", "_crs_test")] = (-0.51, 51.28, 0.33, 51.69)
+    try:
+        abroad = chatbox.crs_choices("_t", fake)
+        check("data outside Malaysia is offered WGS84 and its UTM zone only",
+              len(abroad) == 2 and abroad[1]["epsg"] == 32630,
+              "got %s" % [c["epsg"] for c in abroad])
+    finally:
+        chatbox._extent_cache.pop(("_t", "public", "_crs_test"), None)
+
+
+def test_database_discovery():
+    """Someone else's server must not come up with an empty dropdown."""
+    check("no database allow-list by default", chatbox.VISIBLE_DATABASES == [],
+          "got %s" % chatbox.VISIBLE_DATABASES)
+    check("PostgreSQL's own databases are hidden",
+          "template1" in chatbox.INTERNAL_DATABASES)
+    check("a provider's admin database is hidden",
+          "rdsadmin" in chatbox.INTERNAL_DATABASES)
+    check("an internal database is not allowed through the API",
+          not chatbox.db_allowed("template1"))
+    check("an ordinary database is allowed through the API",
+          chatbox.db_allowed("anybody_elses_database"))
 
 
 def main():
