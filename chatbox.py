@@ -2806,38 +2806,79 @@ def probe_network(host, port=5432, timeout=8):
     return out
 
 
-def probe_database():
+def probe_database_bounded(seconds=25):
+    """Run the database probe, but always answer.
+
+    The probe is the thing most likely to hang, so it runs on its own thread
+    and fills its findings in as it goes. Whatever it reached by the deadline
+    is reported, which is what says *where* a stall happens rather than only
+    that one did.
+    """
+    out = {}
+    worker = threading.Thread(target=probe_database, args=(out,), daemon=True)
+    worker.start()
+    worker.join(seconds)
+    if worker.is_alive():
+        out["verdict"] = ("still running after {}s - stalled at the step after "
+                          "the last one timed below".format(seconds))
+    return out
+
+
+def probe_database(out=None):
     """Try the connection now and report what happened, with timings.
 
     The warm-up runs once at startup; this lets someone re-test after changing
-    a setting without waiting for a restart.
+    a setting without waiting for a restart. Findings are written into `out`
+    step by step so a caller that gives up still sees how far it got.
     """
-    out = {}
-    started = time.time()
+    out = {} if out is None else out
+
+    def phase(name, fn):
+        """Run one step, timing it, and stop the probe at the first failure."""
+        out["step"] = name
+        started = time.time()
+        try:
+            value = fn()
+            out[name] = "{:.1f}s".format(time.time() - started)
+            return value, True
+        except Exception as e:
+            out[name] = "{:.1f}s".format(time.time() - started)
+            out["failed_at"] = name
+            out["error"] = "{}: {}".format(type(e).__name__, str(e).strip())[:300]
+            return None, False
+
+    # Deliberately not through the pool: this separates a connection that will
+    # not open from a pool that is holding one, which look the same from a URL.
+    cfg = dict(DB_CONFIG)
+    cfg["database"] = ADMIN_DB
+    raw, ok = phase("1_raw_connect", lambda: psycopg2.connect(**cfg))
+    if not ok:
+        return out
     try:
-        names = get_databases()
-        out["listed_databases"] = names
-        out["listing_took"] = "{:.1f}s".format(time.time() - started)
-    except Exception as e:
-        out["listing_took"] = "{:.1f}s".format(time.time() - started)
-        out["failed_at"] = "listing databases"
-        out["error"] = "{}: {}".format(type(e).__name__, str(e).strip())[:300]
+        _, ok = phase("2_select_1", lambda: raw.cursor().execute("SELECT 1"))
+        if ok:
+            phase("3_set_statement_timeout", lambda: _cap_query_time(raw))
+    finally:
+        try:
+            raw.close()
+        except Exception:
+            pass
+    if not ok:
         return out
 
+    names, ok = phase("4_list_databases", get_databases)
+    if not ok:
+        return out
+    out["listed_databases"] = names
     if not names:
-        out["failed_at"] = "allow-list left nothing to show"
+        out["failed_at"] = "the allow-list left nothing to show"
         return out
 
-    started = time.time()
-    try:
-        tables = get_schema_info(names[0])
+    tables, ok = phase("5_read_schema", lambda: get_schema_info(names[0]))
+    if ok:
         out["read_schema_of"] = names[0]
-        out["schema_took"] = "{:.1f}s".format(time.time() - started)
         out["tables_found"] = [t["table"] for t in tables]
-    except Exception as e:
-        out["schema_took"] = "{:.1f}s".format(time.time() - started)
-        out["failed_at"] = "reading the schema of " + names[0]
-        out["error"] = "{}: {}".format(type(e).__name__, str(e).strip())[:300]
+    out["step"] = "finished"
     return out
 
 
@@ -2862,8 +2903,8 @@ def healthz():
             # Network only: always answers, even with the pool wedged.
             out["network"] = probe_network(DB_CONFIG.get("host", ""))
         elif probe == "db":
-            # Goes through psycopg2 and the pool, so it can hang if they are.
-            out["probe"] = probe_database()
+            # Bounded, and reports how far it got if it does not finish.
+            out["probe"] = probe_database_bounded()
     return jsonify(out)
 
 
