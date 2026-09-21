@@ -141,7 +141,10 @@ ADMIN_DB = DB_CONFIG.pop("_default_db", "postgres")
 # holds a worker thread until gunicorn's 120s timeout - a quarter of this
 # site's concurrency - and the visitor stares at a spinner the whole time.
 STATEMENT_TIMEOUT_MS = int(os.environ.get("STATEMENT_TIMEOUT_MS", "20000"))
-DB_CONFIG["options"] = "-c statement_timeout={}".format(STATEMENT_TIMEOUT_MS)
+# Applied per connection in _Pool.borrow, not passed in the connection options.
+# A pooler refuses it in the startup packet - Neon's "-pooler" host answers
+# "unsupported startup parameter in options: statement_timeout" and drops the
+# connection, so sending it there stops the app reaching the database at all.
 DB_CONFIG["connect_timeout"] = int(os.environ.get("CONNECT_TIMEOUT", "10"))
 DB_CONFIG["application_name"] = "database-chat"
 
@@ -248,6 +251,24 @@ _pools = {}
 _pools_lock = threading.Lock()
 
 
+def _cap_query_time(conn):
+    """Cap query time on the connection itself, as a statement.
+
+    Re-applied on every borrow rather than set once: a transaction-pooled
+    connection can come back with session settings already discarded, so it
+    cannot be assumed to still be in force.
+    """
+    if STATEMENT_TIMEOUT_MS <= 0:
+        return
+    cur = conn.cursor()
+    try:
+        # The value is an int from the environment, so it cannot carry SQL.
+        cur.execute("SET statement_timeout = {:d}".format(STATEMENT_TIMEOUT_MS))
+        conn.commit()
+    finally:
+        cur.close()
+
+
 class _Pool(object):
     """A psycopg2 pool with a doorman.
 
@@ -266,10 +287,17 @@ class _Pool(object):
         if not self.slots.acquire(timeout=POOL_WAIT):
             raise RuntimeError("The database is busy - please try again in a moment.")
         try:
-            return _PooledConnection(self, self.pool.getconn())
+            conn = self.pool.getconn()
         except Exception:
             self.slots.release()
             raise
+        try:
+            _cap_query_time(conn)
+        except Exception as e:
+            # The cap is a safety net, not a requirement - a server that will
+            # not take it is still perfectly usable.
+            log.debug("could not set statement_timeout: %s", e)
+        return _PooledConnection(self, conn)
 
     def give_back(self, conn, broken):
         try:
@@ -435,13 +463,22 @@ def warm_schema_cache():
     time the first visitor has picked a database.
     """
     global _startup_problem
+    _startup_problem = "still connecting..."
     try:
         names = get_databases()
-        _startup_problem = None
     except Exception as e:
-        _startup_problem = "{}: {}".format(type(e).__name__, str(e).strip())[:300]
+        _startup_problem = "listing databases - {}: {}".format(
+            type(e).__name__, str(e).strip())[:300]
         log.warning("schema warm-up: cannot list databases (%s)", e)
         return
+    if not names:
+        _startup_problem = ("connected, but no database matched the allow-list "
+                            "{!r}".format(VISIBLE_DATABASES))
+        return
+
+    # A per-database failure used to be logged and forgotten, which left
+    # /healthz reporting no problem while nothing had actually loaded.
+    trouble = []
     for dbname in names:
         if _cached_schema(dbname) is not None:
             continue
@@ -450,7 +487,10 @@ def warm_schema_cache():
             get_schema_info(dbname)
             log.info("schema warm-up: %s ready in %.1fs", dbname, time.time() - started)
         except Exception as e:
+            trouble.append("{} after {:.0f}s - {}: {}".format(
+                dbname, time.time() - started, type(e).__name__, str(e).strip()))
             log.warning("schema warm-up: %s failed (%s)", dbname, e)
+    _startup_problem = " | ".join(trouble)[:400] if trouble else None
 
 
 def _read_schema_info(dbname):
@@ -2712,6 +2752,41 @@ def db_diagnosis():
     }
 
 
+def probe_database():
+    """Try the connection now and report what happened, with timings.
+
+    The warm-up runs once at startup; this lets someone re-test after changing
+    a setting without waiting for a restart.
+    """
+    out = {}
+    started = time.time()
+    try:
+        names = get_databases()
+        out["listed_databases"] = names
+        out["listing_took"] = "{:.1f}s".format(time.time() - started)
+    except Exception as e:
+        out["listing_took"] = "{:.1f}s".format(time.time() - started)
+        out["failed_at"] = "listing databases"
+        out["error"] = "{}: {}".format(type(e).__name__, str(e).strip())[:300]
+        return out
+
+    if not names:
+        out["failed_at"] = "allow-list left nothing to show"
+        return out
+
+    started = time.time()
+    try:
+        tables = get_schema_info(names[0])
+        out["read_schema_of"] = names[0]
+        out["schema_took"] = "{:.1f}s".format(time.time() - started)
+        out["tables_found"] = [t["table"] for t in tables]
+    except Exception as e:
+        out["schema_took"] = "{:.1f}s".format(time.time() - started)
+        out["failed_at"] = "reading the schema of " + names[0]
+        out["error"] = "{}: {}".format(type(e).__name__, str(e).strip())[:300]
+    return out
+
+
 @app.route('/healthz')
 def healthz():
     """So a host can tell the app is alive without touching the database.
@@ -2719,11 +2794,17 @@ def healthz():
     While nothing has loaded, it also says why - that is exactly when someone
     is staring at a deployed URL wondering what is wrong. It goes away on its
     own once a schema is in, so a working site publishes nothing extra.
+
+    /healthz?probe=1 retries the connection there and then, which saves a
+    restart after changing a setting. Only while nothing has loaded, so it
+    cannot be used to hammer a healthy database.
     """
     warm = sorted(_schema_cache.keys())
     out = {"ok": True, "warm": warm}
     if not warm:
         out["diagnosis"] = db_diagnosis()
+        if request.args.get("probe") == "1":
+            out["probe"] = probe_database()
     return jsonify(out)
 
 
