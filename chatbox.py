@@ -422,15 +422,24 @@ def get_schema_info(dbname, refresh=False):
         return tables
 
 
+# Why the database could not be reached, kept for /healthz. A deployed app is
+# a black box otherwise: the logs say what went wrong, but the person who has
+# to fix it is usually looking at a URL, not at a log tail.
+_startup_problem = None
+
+
 def warm_schema_cache():
     """Read every visible schema up front, in the background.
 
     Called from a daemon thread at startup so the site is already warm by the
     time the first visitor has picked a database.
     """
+    global _startup_problem
     try:
         names = get_databases()
+        _startup_problem = None
     except Exception as e:
+        _startup_problem = "{}: {}".format(type(e).__name__, str(e).strip())[:300]
         log.warning("schema warm-up: cannot list databases (%s)", e)
         return
     for dbname in names:
@@ -2684,10 +2693,38 @@ def list_crs():
         return oops(e)
 
 
+def db_diagnosis():
+    """Where the app is trying to connect, and what went wrong.
+
+    Never includes the password. The host and user are what separate the two
+    ways this goes wrong on a host like Render: "DATABASE_URL was never set"
+    shows localhost, "set but wrong" shows the real server.
+    """
+    return {
+        "reading": "DATABASE_URL" if os.environ.get("DATABASE_URL", "").strip()
+                   else "PGHOST/PGUSER (DATABASE_URL is not set)",
+        "host": DB_CONFIG.get("host"),
+        "user": DB_CONFIG.get("user"),
+        "sslmode": DB_CONFIG.get("sslmode", "(not set)"),
+        "looks_up_databases_in": ADMIN_DB,
+        "allow_list": VISIBLE_DATABASES or "(none - every database is offered)",
+        "problem": _startup_problem or "(no error recorded yet)",
+    }
+
+
 @app.route('/healthz')
 def healthz():
-    """So a host can tell the app is alive without touching the database."""
-    return jsonify({"ok": True, "warm": sorted(_schema_cache.keys())})
+    """So a host can tell the app is alive without touching the database.
+
+    While nothing has loaded, it also says why - that is exactly when someone
+    is staring at a deployed URL wondering what is wrong. It goes away on its
+    own once a schema is in, so a working site publishes nothing extra.
+    """
+    warm = sorted(_schema_cache.keys())
+    out = {"ok": True, "warm": warm}
+    if not warm:
+        out["diagnosis"] = db_diagnosis()
+    return jsonify(out)
 
 
 def start_up():
