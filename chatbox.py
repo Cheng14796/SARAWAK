@@ -249,6 +249,7 @@ POOL_MAX = int(os.environ.get("DB_POOL_MAX", "6"))
 POOL_WAIT = float(os.environ.get("DB_POOL_WAIT", "10"))
 
 _pools = {}
+_pool_locks = {}
 _pools_lock = threading.Lock()
 
 
@@ -305,7 +306,11 @@ class _Pool(object):
                 cfg["hostaddr"] = addr
                 log.info("connecting to %s over IPv4 %s", cfg["host"], addr)
         self.slots = threading.Semaphore(POOL_MAX)
-        self.pool = psycopg2.pool.ThreadedConnectionPool(1, POOL_MAX, **cfg)
+        # minconn=0: constructing a pool must not open a connection. With
+        # minconn=1 the constructor does network I/O, which turns "the database
+        # is slow to answer" into "this object cannot be built" - and whoever
+        # is building it is holding a lock at the time.
+        self.pool = psycopg2.pool.ThreadedConnectionPool(0, POOL_MAX, **cfg)
 
     def borrow(self):
         if not self.slots.acquire(timeout=POOL_WAIT):
@@ -375,7 +380,21 @@ class _PooledConnection(object):
 
 
 def _pool_for(dbname):
+    """The pool for one database, built at most once.
+
+    The global lock only ever guards the dictionary, never the building of a
+    pool. Holding it across a connection attempt meant one unreachable database
+    could wedge every other one - and every request in the process with it,
+    permanently, because nothing ever released it.
+    """
+    pool = _pools.get(dbname)
+    if pool is not None:
+        return pool
     with _pools_lock:
+        lock = _pool_locks.get(dbname)
+        if lock is None:
+            lock = _pool_locks[dbname] = threading.Lock()
+    with lock:                       # serialises this database only
         pool = _pools.get(dbname)
         if pool is None:
             pool = _Pool(dbname)
