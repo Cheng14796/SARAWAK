@@ -14,6 +14,7 @@ import psycopg2
 import psycopg2.pool
 import logging
 import threading
+import socket
 import time
 import json
 import re
@@ -251,6 +252,22 @@ _pools = {}
 _pools_lock = threading.Lock()
 
 
+# Managed databases usually publish both A and AAAA records. A host that has
+# an IPv6 address but no route to the internet over it will sit there until the
+# connection times out rather than failing, because the packets go nowhere.
+# Set DB_PREFER_IPV4=1 to dial the IPv4 address and skip that entirely.
+PREFER_IPV4 = os.environ.get("DB_PREFER_IPV4", "0").lower() in ("1", "true", "yes")
+
+
+def _ipv4_for(host):
+    try:
+        infos = socket.getaddrinfo(host, 5432, socket.AF_INET, socket.SOCK_STREAM)
+    except Exception as e:
+        log.warning("no IPv4 address for %s (%s)", host, e)
+        return None
+    return infos[0][4][0] if infos else None
+
+
 def _cap_query_time(conn):
     """Cap query time on the connection itself, as a statement.
 
@@ -280,6 +297,13 @@ class _Pool(object):
     def __init__(self, dbname):
         cfg = dict(DB_CONFIG)
         cfg["database"] = dbname
+        if PREFER_IPV4 and cfg.get("host"):
+            addr = _ipv4_for(cfg["host"])
+            if addr:
+                # host stays for TLS and certificate checking; hostaddr is what
+                # actually gets dialled, so no IPv6 address is ever tried.
+                cfg["hostaddr"] = addr
+                log.info("connecting to %s over IPv4 %s", cfg["host"], addr)
         self.slots = threading.Semaphore(POOL_MAX)
         self.pool = psycopg2.pool.ThreadedConnectionPool(1, POOL_MAX, **cfg)
 
@@ -2752,6 +2776,36 @@ def db_diagnosis():
     }
 
 
+def probe_network(host, port=5432, timeout=8):
+    """Can this machine open a plain TCP socket to the database server?
+
+    Nothing here touches psycopg2 or the connection pool, so it still answers
+    when those are wedged - which is the case worth telling apart. A platform
+    that cannot reach the server at all looks, from outside, exactly like a
+    driver that is hanging.
+    """
+    out = {"host": host, "port": port}
+    started = time.time()
+    try:
+        addrs = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
+        out["resolved_to"] = sorted({a[4][0] for a in addrs})
+        out["dns_took"] = "{:.1f}s".format(time.time() - started)
+    except Exception as e:
+        out["dns_took"] = "{:.1f}s".format(time.time() - started)
+        out["error"] = "DNS {}: {}".format(type(e).__name__, str(e)[:160])
+        return out
+
+    started = time.time()
+    try:
+        sock = socket.create_connection((host, port), timeout=timeout)
+        sock.close()
+        out["tcp"] = "connected in {:.1f}s".format(time.time() - started)
+    except Exception as e:
+        out["tcp"] = "failed after {:.1f}s".format(time.time() - started)
+        out["error"] = "TCP {}: {}".format(type(e).__name__, str(e)[:160])
+    return out
+
+
 def probe_database():
     """Try the connection now and report what happened, with timings.
 
@@ -2803,7 +2857,12 @@ def healthz():
     out = {"ok": True, "warm": warm}
     if not warm:
         out["diagnosis"] = db_diagnosis()
-        if request.args.get("probe") == "1":
+        probe = request.args.get("probe")
+        if probe == "1":
+            # Network only: always answers, even with the pool wedged.
+            out["network"] = probe_network(DB_CONFIG.get("host", ""))
+        elif probe == "db":
+            # Goes through psycopg2 and the pool, so it can hang if they are.
             out["probe"] = probe_database()
     return jsonify(out)
 
