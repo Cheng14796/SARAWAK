@@ -324,8 +324,9 @@ class _Pool(object):
             _cap_query_time(conn)
         except Exception as e:
             # The cap is a safety net, not a requirement - a server that will
-            # not take it is still perfectly usable.
-            log.debug("could not set statement_timeout: %s", e)
+            # not take it is still usable, but say so: without it a runaway
+            # query has nothing to stop it.
+            log.warning("could not set statement_timeout: %s", e)
         return _PooledConnection(self, conn)
 
     def give_back(self, conn, broken):
@@ -402,7 +403,53 @@ def _pool_for(dbname):
         return pool
 
 
+class _DirectConnection(object):
+    """A plain connection that behaves like a pooled one.
+
+    Every call site does `conn = get_connection(db)` then `conn.close()`, so
+    this slots in unchanged - close() really closes instead of handing back.
+    """
+
+    def __init__(self, conn):
+        self._conn = conn
+
+    def __getattr__(self, name):
+        return getattr(self.__dict__["_conn"], name)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+    def close(self):
+        try:
+            self._conn.close()
+        except Exception:
+            pass
+
+
 def get_connection(dbname):
+    """A connection to one database, pooled unless pooling is switched off.
+
+    DB_POOL_MAX=0 opens a fresh connection per call. Slower - a TLS handshake
+    every time - but it removes the pool from the picture entirely, which is
+    worth having when a pool is the thing under suspicion.
+    """
+    if POOL_MAX <= 0:
+        cfg = dict(DB_CONFIG)
+        cfg["database"] = dbname
+        if PREFER_IPV4 and cfg.get("host"):
+            addr = _ipv4_for(cfg["host"])
+            if addr:
+                cfg["hostaddr"] = addr
+        conn = psycopg2.connect(**cfg)
+        try:
+            _cap_query_time(conn)
+        except Exception as e:
+            log.warning("could not set statement_timeout: %s", e)
+        return _DirectConnection(conn)
     return _pool_for(dbname).borrow()
 
 
@@ -441,16 +488,22 @@ def has_user_tables(dbname):
     return found
 
 
+def _list_database_names(conn):
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT datname FROM pg_database "
+                    "WHERE datistemplate = false AND datallowconn "
+                    "ORDER BY datname")
+        return [r[0] for r in cur.fetchall()]
+    finally:
+        cur.close()
+
+
 def get_databases():
     """Every database worth offering, or exactly the configured list."""
     conn = get_connection(ADMIN_DB)
     try:
-        cur = conn.cursor()
-        cur.execute("SELECT datname FROM pg_database "
-                    "WHERE datistemplate = false AND datallowconn "
-                    "ORDER BY datname")
-        dbs = [r[0] for r in cur.fetchall()]
-        cur.close()
+        dbs = _list_database_names(conn)
     finally:
         conn.close()
 
@@ -2885,7 +2938,22 @@ def probe_database(out=None):
     if not ok:
         return out
 
-    names, ok = phase("4_list_databases", get_databases)
+    # Split, because "the pool will not hand one over" and "the query never
+    # comes back" are different faults with the same symptom.
+    pooled, ok = phase("4a_pool_borrow", lambda: get_connection(ADMIN_DB))
+    if not ok:
+        return out
+    try:
+        _, ok = phase("4b_pg_database_query", lambda: _list_database_names(pooled))
+    finally:
+        try:
+            pooled.close()
+        except Exception:
+            pass
+    if not ok:
+        return out
+
+    names, ok = phase("4c_list_databases", get_databases)
     if not ok:
         return out
     out["listed_databases"] = names
